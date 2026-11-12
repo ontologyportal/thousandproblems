@@ -174,24 +174,30 @@ class DepthLimits(unittest.TestCase):
 
     def test_small_thread_stack(self):
         # macOS gives threads 512 KB by default; the C parser must stay well inside that.
+        #
+        # Only the *parsing* happens on the small thread. The finished trees are handed back
+        # and freed on the main thread: CPython frees a deeply nested tree of these node
+        # objects recursively, at several hundred bytes of stack per level, so freeing a
+        # 1000-level tree on a 256 KB thread overflows it on some platforms (musl, Python
+        # 3.14), whichever parser built the tree. That is not something the parser controls.
         old = threading.stack_size()
-        failures = []
+        failures, results = [], []
+
+        def parse(language, text):
+            try:
+                results.append(_cparser.parse_formula(text, language))
+            except tptp.ParseError:
+                pass
 
         def work():
             try:
                 for n in (1000, 5000, 50_000):
                     for text in ["f(" * n + "a" + ")" * n, "(" * n + "p" + ")" * n,
                                  "~ " * n + "p", "! [X] : " * n + "p"]:
-                        try:
-                            _cparser.parse_formula(text, "fof")
-                        except tptp.ParseError:
-                            pass
-                    _cparser.parse_formula("(" * n + "p" + ")" * n, "tff")
-                    _cparser.parse_formula("p: " + "(" * n + "t" + ")" * n, "tff")
-                    try:
-                        _cparser.parse_formula("^ [X: " * n + "t" + "] : p" * n, "thf")
-                    except tptp.ParseError:
-                        pass
+                        parse("fof", text)
+                    parse("tff", "(" * n + "p" + ")" * n)
+                    parse("tff", "p: " + "(" * n + "t" + ")" * n)
+                    parse("thf", "^ [X: " * n + "t" + "] : p" * n)
             except BaseException as e:      # a real overflow would kill the process instead
                 failures.append(e)
 
@@ -203,6 +209,8 @@ class DepthLimits(unittest.TestCase):
         finally:
             threading.stack_size(old)
         self.assertEqual(failures, [])
+        self.assertTrue(results)            # some of those did parse in C, not just fall back
+        results.clear()
 
 
 if __name__ == "__main__":

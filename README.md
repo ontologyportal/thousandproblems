@@ -109,6 +109,12 @@ or a few hundred of bare parentheses) to the Python parser, so that it can never
 C stack, even on a thread with a small one. You get the same result either way, just more
 slowly.
 
+One thing the parser cannot control: CPython frees a very deeply nested tree recursively, using
+a few hundred bytes of stack per level. Freeing a tree around a thousand levels deep on a thread
+with a tiny stack (256 KB) crashed Python 3.14 on musl Linux, with either parser. If you handle
+inputs like that, don't do it on threads with stacks that small; the default thread stack size on
+every mainstream platform is fine.
+
 Measured on an Apple M-series laptop, Python 3.14, on generated problems of 0.4 to 0.7 MB:
 
 | | pure Python | C | speedup |
