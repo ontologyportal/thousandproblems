@@ -1,0 +1,6 @@
+from typing import Optional
+
+from .nodes import Node, TPTPFile
+
+def parse(text: str, filename: Optional[str]) -> TPTPFile: ...
+def parse_formula(text: str, language: str) -> Node: ...

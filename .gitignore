@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+build/
+dist/
+wheelhouse/
+*.egg-info/
+.venv*/
+.DS_Store
+PUBLISHING.md

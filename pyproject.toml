@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thousandproblems"
+version = "0.1.0"
+description = "Fast parser and printer for the TPTP problem and solution syntax (thf, tff, tcf, fof, cnf, tpi)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Ontology Portal", email = "pypi@ontologyportal.org" }]
+keywords = ["tptp", "parser", "theorem proving", "automated reasoning", "logic", "first-order logic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+    "Typing :: Typed",
+]
+[project.urls]
+Home = "https://ontologyportal.org"
+Source = "https://github.com/ontologyportal/thousandproblems"
+Issues = "https://github.com/ontologyportal/thousandproblems/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["thousandproblems"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+thousandproblems = ["py.typed", "*.pyi"]
+
+[tool.cibuildwheel]
+build = "cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_i686 *-manylinux_i686"
+test-command = "python -c \"import thousandproblems; assert thousandproblems.BACKEND == 'c', thousandproblems.BACKEND\" && python -m unittest discover -s {project}/tests"
+
+[tool.cibuildwheel.environment]
+THOUSANDPROBLEMS_REQUIRE_EXT = "1"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

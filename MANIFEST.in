@@ -1,0 +1,6 @@
+include README.md CHANGELOG.md
+include src/thousandproblems/_cparser.c src/thousandproblems/_cparser.pyi src/thousandproblems/py.typed
+recursive-include tests *.py
+recursive-include benchmarks *.py
+prune tests/__pycache__
+global-exclude *.py[cod] *.so *.pyd .DS_Store
