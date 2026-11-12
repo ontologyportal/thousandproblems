@@ -408,7 +408,7 @@ class OnlineLibrary(Library):
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-                    temporary.write_text(text, encoding="utf-8")
+                    temporary.write_bytes(text.encode("utf-8"))      # bytes: no newline translation on Windows
                     os.replace(temporary, target)
                 except OSError:
                     pass        # a cache that can't be written is not an error

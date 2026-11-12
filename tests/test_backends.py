@@ -39,6 +39,17 @@ def outcome(fn, *args):
     return ("ok", deep(result))
 
 
+@unittest.skipUnless(os.environ.get("THOUSANDPROBLEMS_REQUIRE_EXT"),
+                     "only checked when the C extension is required (release builds)")
+class RequiredExtension(unittest.TestCase):
+    """Release wheels are built with THOUSANDPROBLEMS_REQUIRE_EXT=1; one without the C parser
+    must fail here rather than be published."""
+
+    def test_c_parser_is_present_and_in_use(self):
+        self.assertIsNotNone(_cparser, "the C extension was not built or cannot be imported")
+        self.assertEqual(tptp.BACKEND, "c")
+
+
 @unittest.skipIf(_cparser is None, "C extension not built")
 class Equivalence(unittest.TestCase):
     def same_file(self, text, filename=None):

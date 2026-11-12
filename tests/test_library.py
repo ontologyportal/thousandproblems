@@ -362,6 +362,20 @@ class OnlineTests(Behaviour, TempCase):
         self.assertEqual(cached[0].read_text(), FILES["Problems/SET/SET001-1.p"])
         self.assertEqual(list((self.tmp / "cache").rglob("*.tmp")), [])
 
+    def test_cache_keeps_files_byte_for_byte(self):
+        # CRLF line ends and non-ASCII text must survive the trip through the cache,
+        # including on Windows, where text-mode writes translate newlines.
+        text = "% caf\u00e9\r\ncnf(a,axiom,p).\r\n"
+        server = MockServer({"Problems/AAA/AAA001-1.p": text})
+        self.addCleanup(server.close)
+        first = lib.OnlineLibrary(server.url, cache=self.tmp / "crlf")
+        self.assertEqual(first.problem_text("AAA001-1"), text)
+        cached = next((self.tmp / "crlf").rglob("AAA001-1.p"))
+        self.assertEqual(cached.read_bytes(), text.encode("utf-8"))
+        second = lib.OnlineLibrary(server.url, cache=self.tmp / "crlf")
+        self.assertEqual(second.problem_text("AAA001-1"), text)
+        self.assertEqual(len(server.requests), 1)
+
     def test_shared_axioms_are_downloaded_once(self):
         self.library.problem("SET001-1", expand_includes=True)
         self.library.problem("SET002-1", expand_includes=True)        # axiom file already cached
