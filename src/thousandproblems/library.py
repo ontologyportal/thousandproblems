@@ -293,7 +293,10 @@ class TarballLibrary(Library):
         if member is None:
             return None
         handle = self._tar.extractfile(member)
-        return None if handle is None else _decode(handle.read())
+        if handle is None:
+            return None
+        with handle:
+            return _decode(handle.read())
 
     def problem_names(self, domain: Optional[str] = None) -> list[str]:
         names = []

@@ -479,7 +479,10 @@ class OpenLibrary(TempCase):
         tptp.fetch_problem("SYN000+1", library)
         self.assertIsNotNone(library._tar)
         library.close()
-        with mock.patch.object(lib.TarballLibrary, "close", autospec=True) as close:
+        # A spy, not a stub: the real close must still run, or the file stays open
+        # (and Windows then cannot delete it).
+        real_close = lib.TarballLibrary.close
+        with mock.patch.object(lib.TarballLibrary, "close", autospec=True, side_effect=real_close) as close:
             tptp.fetch_problem("SYN000+1", self.tmp / "t.tgz")
             self.assertEqual(close.call_count, 1)
 
