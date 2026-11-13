@@ -47,7 +47,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Union
 
-from .nodes import AnnotatedFormula, ParseError, TPTPFile, _error_at
+from .nodes import AnnotatedFormula, ParseError, TPTPFile, _error_at, _symbol_table
 
 __all__ = [
     "DirectoryLibrary", "Library", "LibraryError", "OnlineLibrary", "ProblemNotFound",
@@ -209,7 +209,8 @@ class Library:
                     raise fail(f"{item.path!r} has no formulae named {sorted(missing)}")
                 formulae = tuple(selected)
             inputs.extend(formulae)
-        return TPTPFile(tuple(inputs), parsed.comments, parsed.filename)
+        return TPTPFile(tuple(inputs), parsed.comments, parsed.filename,
+                        _symbol_table(i for i in inputs if isinstance(i, AnnotatedFormula)))
 
 
 class DirectoryLibrary(Library):

@@ -10,7 +10,7 @@ directives, and annotations (sources, inference records, useful info).
     >>> ax.language, ax.name, ax.role
     ('fof', 'ax1', 'axiom')
     >>> ax.formula.quantifier, ax.formula.variables
-    ('!', (Variable(name='X'),))
+    ('!', (Variable(name='X', index=1),))
     >>> print(ax)
     fof(ax1,axiom,! [X] : (p(X) => q(X))).
 
@@ -27,6 +27,18 @@ The AST is the same for all languages:
   :class:`Binary`. ``>`` is right-associative.
 * Constants are :class:`Function` with no arguments. Defined and system symbols keep
   their prefix, as in ``Function('$true')``.
+* ``Variable.index`` numbers the distinct variables of a formula 1, 2, 3 ... in order of
+  first appearance, so in ``f(X) | f(Y) | g(X, f(Y))`` every ``X`` has index 1 and every
+  ``Y`` index 2. A quantifier counts as the appearance of the variables it binds, and each
+  binding is its own variable: the two ``X`` of ``(! [X] : p(X)) & (! [X] : q(X))`` get
+  indexes 1 and 2. Numbering starts again for each formula; a variable outside a formula (in
+  an annotation, or built by hand) has index 0.
+* ``TPTPFile.symbols`` is the symbol table: a tuple of :class:`Symbol` ``(name, arity)``,
+  one for each distinct function, constant or predicate the formulae use, in order of first
+  appearance, so ``f/1`` and ``f/2`` are different symbols. Variables, equality, numbers,
+  distinct objects, ``$`` and ``$$`` symbols, type declarations and annotations are not
+  symbols. Each ``AnnotatedFormula`` has its own ``symbols`` too, and the file's table follows
+  ``expand_includes``.
 * Quotes are removed from a word when the result is still a valid lower-case word,
   so ``'cat'`` and ``cat`` compare equal, as the specification requires. Any other
   quoted word keeps its quotes; use :func:`unquote` to get the raw text.
@@ -59,7 +71,7 @@ from typing import Optional, Union
 
 from . import _pyparser
 from .nodes import *  # noqa: F403
-from .nodes import _error_at, __all__ as _node_names
+from .nodes import _error_at, _symbol_table, __all__ as _node_names
 
 _LIBRARY_NAMES = ("DirectoryLibrary", "Library", "LibraryError", "OnlineLibrary", "ProblemNotFound",
                   "RateLimited", "TarballLibrary", "fetch_problem", "open_library")
@@ -158,4 +170,4 @@ def _load(path: Path, root: Optional[Path], expand: bool, stack: tuple[Path, ...
                 raise fail(f"{item.path!r} has no formulae named {sorted(missing)}")
             formulae = tuple(selected)
         inputs.extend(formulae)
-    return TPTPFile(tuple(inputs), parsed.comments, parsed.filename)
+    return TPTPFile(tuple(inputs), parsed.comments, parsed.filename, _symbol_table(i for i in inputs if isinstance(i, AnnotatedFormula)))

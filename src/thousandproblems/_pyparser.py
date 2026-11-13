@@ -7,7 +7,7 @@ import re
 from typing import NamedTuple, Optional, Union
 
 from .nodes import *  # noqa: F403
-from .nodes import _NONASSOC, _TH1_TERMS, _deep_stack, _error_at
+from .nodes import _NONASSOC, _TH1_TERMS, _deep_stack, _error_at, _symbol_table
 
 # ---------------------------------------------------------------------------------
 # Lexer
@@ -125,6 +125,14 @@ class _Parser:
         self.filename = filename
         self.tokens, self.comments = _tokenize(text, filename)
         self.i = 0
+        # Variable numbering and the symbols used, for the formula being parsed.
+        self.numbering = False       # only inside a formula, not in annotations
+        self.count = 0               # variables numbered so far in this formula
+        self.vars: dict[str, int] = {}      # name -> index of the binding in scope (0: none)
+        self.undo: list[tuple[str, int]] = []      # bindings to restore when a quantifier ends
+        self.events: list[Optional[tuple[str, int]]] = []   # (name, arity) of each function use
+        self.type_depth = 0          # > 0 while reading a THF type, whose names are not symbols
+        self.symtab: dict[tuple[str, int], Symbol] = {}     # every symbol of the file
 
     # --- token helpers ------------------------------------------------------------
 
@@ -163,6 +171,55 @@ class _Parser:
         tok = tok or self.tok
         return _error_at(message, self.text, tok.line, tok.column, self.filename)
 
+    # --- variable numbering and symbols ---------------------------------------------
+
+    def begin_formula(self) -> None:
+        self.numbering = True
+        self.count = 0
+        self.vars.clear()
+        self.undo.clear()
+        self.events.clear()
+        self.type_depth = 0
+
+    def bind(self, name: str) -> int:
+        """A quantifier binds a new variable ``name``."""
+        if not self.numbering:
+            return 0
+        self.count += 1
+        self.undo.append((name, self.vars.get(name, 0)))
+        self.vars[name] = self.count
+        return self.count
+
+    def use(self, name: str) -> int:
+        """The index of the variable ``name`` in scope; a variable not bound is numbered on first use."""
+        if not self.numbering:
+            return 0
+        index = self.vars.get(name, 0)
+        if not index:
+            self.count += 1
+            index = self.vars[name] = self.count
+        return index
+
+    def release(self, mark: int) -> None:
+        """A quantifier's scope has ended: restore what its variables shadowed."""
+        undo = self.undo
+        while len(undo) > mark:
+            name, previous = undo.pop()
+            self.vars[name] = previous
+
+    def end_formula(self) -> tuple[Symbol, ...]:
+        """Finish the formula: the symbols it used, in order of first appearance."""
+        self.numbering = False
+        symbols: dict[tuple[str, int], Symbol] = {}
+        for key in self.events:
+            if key not in symbols:
+                symbol = self.symtab.get(key)
+                if symbol is None:
+                    symbol = self.symtab[key] = Symbol(*key)
+                symbols[key] = symbol
+        self.events.clear()
+        return tuple(symbols.values())
+
     # --- files --------------------------------------------------------------------
 
     def parse_file(self) -> TPTPFile:
@@ -175,7 +232,7 @@ class _Parser:
                 inputs.append(self.annotated_formula())
             else:
                 raise self.error(f"expected an annotated formula or include, found {self.describe()}")
-        return TPTPFile(tuple(inputs), tuple(self.comments), self.filename)
+        return TPTPFile(tuple(inputs), tuple(self.comments), self.filename, tuple(self.symtab.values()))
 
     def annotated_formula(self) -> AnnotatedFormula:
         start = self.advance()
@@ -185,7 +242,9 @@ class _Parser:
         self.expect(",")
         role, subrole = self.role()
         self.expect(",")
+        self.begin_formula()
         formula = _FORMULA_RULES[language](self)
+        symbols = self.end_formula()
         annotations = None
         if self.accept(","):
             source = self.source()
@@ -193,7 +252,7 @@ class _Parser:
             annotations = Annotations(source, info)
         self.expect(")")
         self.expect(".")
-        return AnnotatedFormula(language, name, role, formula, annotations, subrole, start.line)
+        return AnnotatedFormula(language, name, role, formula, annotations, subrole, start.line, symbols)
 
     def include(self) -> Include:
         start = self.advance()
@@ -281,8 +340,11 @@ class _Parser:
     def tcf_logic(self) -> Node:
         if self.at("!") and self.peek().text == "[":
             self.advance()
+            mark = len(self.undo)
             variables = self.variable_list("tff")
-            return Quantified("!", variables, self.tcf_logic())
+            body = self.tcf_logic()
+            self.release(mark)
+            return Quantified("!", variables, body)
         return self.cnf_formula()
 
     # --- FOF ----------------------------------------------------------------------
@@ -408,10 +470,12 @@ class _Parser:
 
     def quantified(self, lang: str) -> Quantified:
         quantifier = self.advance().text
+        mark = len(self.undo)
         variables = self.variable_list(lang)
         body_start = self.tok
         body = self.unit(lang)
         self.require_formula(lang, body, body_start)
+        self.release(mark)
         return Quantified(quantifier, variables, body)
 
     def variable_list(self, lang: str) -> tuple[Node, ...]:
@@ -428,14 +492,18 @@ class _Parser:
         if tok.kind != "upper":
             raise self.error(f"expected a variable, found {self.describe()}")
         self.advance()
+        index = self.bind(tok.text)
         if lang == "fof":
-            return Variable(tok.text)
+            return Variable(tok.text, index)
         if lang == "thf":
             self.expect(":")
-            return TypedVariable(tok.text, self.thf_type())
+            self.type_depth += 1
+            var_type = self.thf_type()
+            self.type_depth -= 1
+            return TypedVariable(tok.text, var_type, index)
         if self.accept(":"):
-            return TypedVariable(tok.text, self.tff_atomic_type())
-        return Variable(tok.text)
+            return TypedVariable(tok.text, self.tff_atomic_type(), index)
+        return Variable(tok.text, index)
 
     def primary(self, lang: str) -> Node:
         """A term, or the atomic formula that has the same shape as one."""
@@ -443,7 +511,7 @@ class _Parser:
         kind = tok.kind
         if kind == "upper":
             self.i += 1
-            return Variable(tok.text)
+            return Variable(tok.text, self.use(tok.text))
         if kind in _NUMBER_KINDS:
             self.i += 1
             return Number(tok.text)
@@ -455,12 +523,22 @@ class _Parser:
                 return self.let(lang)
             self.i += 1
             name = self.word_text(tok)
+            # Reserve this use's place in the order of first appearance now, and fill in the
+            # arity once the arguments are read. $-symbols are not recorded.
+            slot = -1
+            if self.numbering and not self.type_depth and kind in _WORD_KINDS:
+                slot = len(self.events)
+                self.events.append(None)
             if self.accept("("):
                 args = [self.argument(lang)]
                 while self.accept(","):
                     args.append(self.argument(lang))
                 self.expect(")")
+                if slot >= 0:
+                    self.events[slot] = (name, len(args))
                 return Function(name, tuple(args))
+            if slot >= 0:
+                self.events[slot] = (name, 0)
             return Function(name)
         if lang != "fof":
             text = tok.text
@@ -598,7 +676,12 @@ class _Parser:
             raise self.error(f"expected an atom to declare a type for, found {self.describe()}")
         self.advance()
         self.expect(":")
-        kind_type = self.thf_type() if lang == "thf" else self.tff_type()
+        if lang == "thf":
+            self.type_depth += 1
+            kind_type = self.thf_type()
+            self.type_depth -= 1
+        else:
+            kind_type = self.tff_type()
         return Typing(self.word_text(tok), kind_type)
 
     def at_subtype(self) -> bool:
@@ -638,11 +721,13 @@ class _Parser:
     def tff_type(self, *, in_parens: bool = False) -> Node:
         if self.tok.text in _TYPE_QUANTIFIERS:
             quantifier = self.advance().text
+            mark = len(self.undo)
             variables = self.variable_list("tff")
             body_start = self.tok
             body = self.tff_type() if self.tok.text in _TYPE_QUANTIFIERS else self.tff_type_primary()
             if isinstance(body, NAry):
                 raise self.error("a product type must be followed by '>'", body_start)
+            self.release(mark)
             return Quantified(quantifier, variables, body)
         start = self.tok
         left = self.tff_type_primary()
@@ -674,7 +759,7 @@ class _Parser:
             return Tuple(tuple(items))
         if tok.kind == "upper":
             self.advance()
-            return Variable(tok.text)
+            return Variable(tok.text, self.use(tok.text))
         if tok.kind == "defined":
             self.advance()
             return Function(tok.text)
@@ -791,7 +876,7 @@ class _Parser:
         kind = tok.kind
         if kind == "upper":
             self.advance()
-            return Variable(tok.text)
+            return Variable(tok.text, self.use(tok.text))
         if kind in _NUMBER_KINDS:
             self.advance()
             return Number(tok.text)
@@ -851,6 +936,7 @@ def parse(text: str, filename: Optional[str] = None) -> TPTPFile:
 def parse_formula(text: str, language: str) -> Node:
     with _deep_stack():
         parser = _Parser(text)
+        parser.begin_formula()
         try:
             formula = _FORMULA_RULES[language](parser)
         except RecursionError:

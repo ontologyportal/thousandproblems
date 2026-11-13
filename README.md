@@ -29,10 +29,46 @@ Import it as `thousandproblems`; the examples below alias it to `tptp`.
 >>> ax.language, ax.name, ax.role
 ('fof', 'ax1', 'axiom')
 >>> ax.formula.quantifier, ax.formula.variables
-('!', (Variable(name='X'),))
+('!', (Variable(name='X', index=1),))
 >>> print(ax)
 fof(ax1,axiom,! [X] : (p(X) => q(X))).
 ```
+
+## Variable indexes and the symbol table
+
+Each `Variable` has an `index`: the distinct variables of one formula are numbered 1, 2, 3 ... in
+order of first appearance.
+
+```python
+>>> clause = tptp.parse("cnf(c, axiom, f(X) | f(Y) | g(X, f(Y))).").formulae[0]
+>>> [(v.name, v.index) for v in tptp.walk(clause.formula) if isinstance(v, tptp.Variable)]
+[('X', 1), ('Y', 2), ('X', 1), ('Y', 2)]
+```
+
+A quantifier counts as the first appearance of the variables it binds, and every binding is its
+own variable, so `! [Y,X] : p(X,Y)` numbers Y 1 and X 2, and `(! [X] : p(X)) & (! [X] : q(X))`
+gives its two `X` the indexes 1 and 2. Numbering restarts for each formula, and a variable that
+is not part of a formula (in an annotation, or built by hand) has index 0. `index` is not
+compared, so `Variable("X") == Variable("X", 1)`.
+
+`problem.symbols` is the symbol table: a tuple of `Symbol(name, arity)`, one for each distinct
+function, constant or predicate the formulae use, in order of first appearance. `f/1` and `f/2`
+are different symbols, and a constant has arity 0.
+
+```python
+>>> problem = tptp.parse("cnf(a, axiom, p(f(a), X) | ~ q(f(a,b))). cnf(b, axiom, p(c, Y)).")
+>>> [str(s) for s in problem.symbols]
+['p/2', 'f/1', 'a/0', 'q/1', 'f/2', 'b/0', 'c/0']
+>>> problem.formulae[1].symbols
+(Symbol(name='p', arity=2), Symbol(name='c', arity=0))
+```
+
+Variables, equality, numbers, distinct objects, `$` and `$$` symbols (`$true`, `$less` ...),
+type declarations and annotations are not symbols. In THF, `f @ a` uses the symbols `f/0` and
+`a/0`. Each formula has its own `symbols`, and the file's table is rebuilt when
+`expand_includes` brings other files in, so it only covers formulae that are really there.
+
+## Functions
 
 | Function | |
 | --- | --- |
@@ -119,10 +155,10 @@ Measured on an Apple M-series laptop, Python 3.14, on generated problems of 0.4 
 
 | | pure Python | C | speedup |
 | --- | --- | --- | --- |
-| cnf | 0.259 s | 0.024 s | 10.7x |
-| fof | 0.252 s | 0.024 s | 10.6x |
-| tff | 0.206 s | 0.018 s | 11.3x |
-| thf | 0.156 s | 0.012 s | 12.9x |
+| cnf | 0.274 s | 0.026 s | 10.5x |
+| fof | 0.269 s | 0.027 s | 10.0x |
+| tff | 0.221 s | 0.020 s | 10.9x |
+| thf | 0.160 s | 0.013 s | 12.4x |
 
 Run `python benchmarks/bench.py` to measure on your machine.
 

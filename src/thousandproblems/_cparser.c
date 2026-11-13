@@ -16,6 +16,7 @@
 #include <Python.h>
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -90,14 +91,15 @@ static const char *const RULE_NAMES[NRULES] = {"thf", "tff", "tcf", "fof", "cnf"
     X(Include) X(Comment) X(TPTPFile) X(Not) X(Box) X(Diamond) X(Or) X(And) X(Apply)       \
     X(Product) X(Sum) X(Implies) X(ImpliedBy) X(Iff) X(Xor) X(Nor) X(Nand) X(Equals)       \
     X(NotEquals) X(Arrow) X(Definition) X(Assignment) X(Sequent) X(Subtype) X(Colon)       \
-    X(ForAll) X(Exists) X(Lambda) X(Choice) X(Description) X(TypeForAll) X(TypeExists)
+    X(ForAll) X(Exists) X(Lambda) X(Choice) X(Description) X(TypeForAll) X(TypeExists)  \
+    X(Symbol)
 
 #define FIELD_LIST(X)                                                                      \
     X(name) X(args) X(text) X(op) X(arg) X(left) X(right) X(items) X(type) X(quantifier)   \
     X(variables) X(body) X(atom) X(term) X(params) X(connective) X(types) X(definitions)   \
     X(language) X(formula) X(source) X(details) X(rule) X(info) X(parents) X(kind)         \
     X(file) X(sources) X(annotations) X(subrole) X(line) X(role) X(selection) X(space)     \
-    X(inputs) X(comments) X(filename)
+    X(inputs) X(comments) X(filename) X(index) X(arity) X(symbols)
 
 typedef struct {
     PyObject *error_at;
@@ -214,6 +216,137 @@ typedef struct {
     int kind;
 } Tok;
 
+/* ------------------------------------------------------------------------------------
+ * A small hash table from (name, arity) to an id, with the entries kept in the order they
+ * were added. It is used for the variables of one formula (arity 0) and for the symbols of
+ * a file. Keys are not copied: they point into memory that outlives the table.
+ * ---------------------------------------------------------------------------------- */
+
+typedef struct {
+    const char *key;
+    Py_ssize_t klen, arity;
+    Py_ssize_t val;    /* variables: index of the binding in scope, 0 for none */
+    Py_ssize_t stamp;  /* symbols: number of the last formula that used it */
+    PyObject *obj;     /* symbols: the Symbol */
+    uint64_t hash;
+} HEnt;
+
+typedef struct {
+    HEnt *ent;
+    Py_ssize_t n, cap;
+    Py_ssize_t *slot; /* open addressing; entry ids, -1 for empty */
+    Py_ssize_t nslot; /* a power of two, or 0 */
+} HTab;
+
+static uint64_t
+hash_key(const char *k, Py_ssize_t len, Py_ssize_t arity)
+{
+    uint64_t h = 1469598103934665603ULL ^ ((uint64_t)arity * 0x9E3779B97F4A7C15ULL);
+    for (Py_ssize_t i = 0; i < len; i++) {
+        h ^= (unsigned char)k[i];
+        h *= 1099511628211ULL;
+    }
+    return h ^ (h >> 32);
+}
+
+static int
+htab_rehash(HTab *t, Py_ssize_t nslot)
+{
+    Py_ssize_t *slot = (Py_ssize_t *)PyMem_Malloc((size_t)nslot * sizeof(Py_ssize_t));
+    if (slot == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    for (Py_ssize_t i = 0; i < nslot; i++) slot[i] = -1;
+    for (Py_ssize_t id = 0; id < t->n; id++) {
+        Py_ssize_t i = (Py_ssize_t)(t->ent[id].hash & (uint64_t)(nslot - 1));
+        while (slot[i] >= 0) i = (i + 1) & (nslot - 1);
+        slot[i] = id;
+    }
+    PyMem_Free(t->slot);
+    t->slot = slot;
+    t->nslot = nslot;
+    return 0;
+}
+
+/* The id of (key, arity), adding it if it is new (*added tells which). -1 on failure. */
+static Py_ssize_t
+htab_intern(HTab *t, const char *key, Py_ssize_t klen, Py_ssize_t arity, int *added)
+{
+    uint64_t h = hash_key(key, klen, arity);
+    if (t->nslot == 0 || (t->n + 1) * 2 > t->nslot) {
+        if (htab_rehash(t, t->nslot ? t->nslot * 2 : 64) < 0) return -1;
+    }
+    Py_ssize_t mask = t->nslot - 1, i = (Py_ssize_t)(h & (uint64_t)mask);
+    for (;;) {
+        Py_ssize_t id = t->slot[i];
+        if (id < 0) break;
+        HEnt *e = &t->ent[id];
+        if (e->hash == h && e->klen == klen && e->arity == arity &&
+            memcmp(e->key, key, (size_t)klen) == 0) {
+            *added = 0;
+            return id;
+        }
+        i = (i + 1) & mask;
+    }
+    if (t->n == t->cap) {
+        Py_ssize_t cap = t->cap ? t->cap * 2 : 16;
+        HEnt *ent = (HEnt *)PyMem_Realloc(t->ent, (size_t)cap * sizeof(HEnt));
+        if (ent == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        t->ent = ent;
+        t->cap = cap;
+    }
+    HEnt *e = &t->ent[t->n];
+    e->key = key;
+    e->klen = klen;
+    e->arity = arity;
+    e->val = 0;
+    e->stamp = 0;
+    e->obj = NULL;
+    e->hash = h;
+    t->slot[i] = t->n;
+    *added = 1;
+    return t->n++;
+}
+
+/* Forget every entry, keeping a small table for reuse but not a huge one. */
+static void
+htab_reset(HTab *t)
+{
+    t->n = 0;
+    if (t->nslot > 4096) {
+        PyMem_Free(t->slot);
+        PyMem_Free(t->ent);
+        t->slot = NULL;
+        t->ent = NULL;
+        t->nslot = t->cap = 0;
+    }
+    else {
+        for (Py_ssize_t i = 0; i < t->nslot; i++) t->slot[i] = -1;
+    }
+}
+
+static void
+htab_free(HTab *t)
+{
+    for (Py_ssize_t id = 0; id < t->n; id++) Py_XDECREF(t->ent[id].obj);
+    PyMem_Free(t->slot);
+    PyMem_Free(t->ent);
+    memset(t, 0, sizeof *t);
+}
+
+typedef struct {
+    Py_ssize_t id, prev; /* a variable's entry, and the binding it shadowed */
+} Undo;
+
+typedef struct {
+    PyObject *name; /* NULL until the arguments are read */
+    Py_ssize_t arity;
+} Ev;
+
 typedef struct {
     State *st;
     PyObject *text;     /* the str being parsed (borrowed) */
@@ -225,6 +358,17 @@ typedef struct {
     uintptr_t stack_base;
     int too_deep;
     Vec comments;
+    /* variable numbering and the symbols of the formula being parsed */
+    int numbering;      /* on inside a formula, off in annotations */
+    int type_depth;     /* > 0 while reading a THF type, whose names are not symbols */
+    Py_ssize_t count;   /* variables numbered so far in this formula */
+    Py_ssize_t formula_no;
+    HTab vars;
+    Undo *undo;
+    Py_ssize_t undo_n, undo_cap;
+    Ev *events;
+    Py_ssize_t ev_n, ev_cap;
+    HTab symtab;        /* every symbol of the file, in order of first appearance */
 } Parser;
 
 #define CUR(p) (&(p)->toks[(p)->i])
@@ -479,6 +623,171 @@ mk_tuple_node(Parser *p, Vec *items)
     PyObject *r = mk(st->c_Tuple, 1, st->n_items, t);
     Py_DECREF(t);
     return r;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Variable numbering and symbols. These mirror begin_formula and friends in _pyparser.py.
+ * ---------------------------------------------------------------------------------- */
+
+static void
+ev_clear(Parser *p)
+{
+    for (Py_ssize_t i = 0; i < p->ev_n; i++) Py_XDECREF(p->events[i].name);
+    p->ev_n = 0;
+}
+
+static void
+begin_formula(Parser *p)
+{
+    p->numbering = 1;
+    p->count = 0;
+    p->type_depth = 0;
+    p->formula_no++;
+    htab_reset(&p->vars);
+    p->undo_n = 0;
+    ev_clear(p);
+}
+
+/* A quantifier binds a new variable. Returns its index, or -1 on failure. */
+static Py_ssize_t
+var_bind(Parser *p, const Tok *t)
+{
+    if (!p->numbering) return 0;
+    int added;
+    Py_ssize_t id = htab_intern(&p->vars, p->s + t->start, t->end - t->start, 0, &added);
+    if (id < 0) return -1;
+    if (p->undo_n == p->undo_cap) {
+        Py_ssize_t cap = p->undo_cap ? p->undo_cap * 2 : 16;
+        Undo *u = (Undo *)PyMem_Realloc(p->undo, (size_t)cap * sizeof(Undo));
+        if (u == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        p->undo = u;
+        p->undo_cap = cap;
+    }
+    HEnt *e = &p->vars.ent[id];
+    p->undo[p->undo_n].id = id;
+    p->undo[p->undo_n].prev = e->val;
+    p->undo_n++;
+    e->val = ++p->count;
+    return e->val;
+}
+
+/* The index of the variable in scope with this name; one not bound is numbered on first use. */
+static Py_ssize_t
+var_use(Parser *p, const Tok *t)
+{
+    if (!p->numbering) return 0;
+    int added;
+    Py_ssize_t id = htab_intern(&p->vars, p->s + t->start, t->end - t->start, 0, &added);
+    if (id < 0) return -1;
+    HEnt *e = &p->vars.ent[id];
+    if (e->val == 0) e->val = ++p->count;
+    return e->val;
+}
+
+/* A quantifier's scope has ended: restore the bindings its variables shadowed. */
+static void
+var_release(Parser *p, Py_ssize_t mark)
+{
+    while (p->undo_n > mark) {
+        p->undo_n--;
+        p->vars.ent[p->undo[p->undo_n].id].val = p->undo[p->undo_n].prev;
+    }
+}
+
+/* Variable(name, index) or TypedVariable(name, type, index). `type` may be NULL. */
+static PyObject *
+mk_variable(Parser *p, const Tok *t, Py_ssize_t index, PyObject *type)
+{
+    State *st = S(p);
+    PyObject *text = tok_text(p, t), *idx = PyLong_FromSsize_t(index), *r = NULL;
+    if (text && idx) {
+        if (type == NULL) {
+            r = mk(st->c_Variable, 2, st->n_name, text, st->n_index, idx);
+        }
+        else {
+            r = mk(st->c_TypedVariable, 3, st->n_name, text, st->n_type, type, st->n_index, idx);
+        }
+    }
+    Py_XDECREF(text);
+    Py_XDECREF(idx);
+    return r;
+}
+
+static PyObject *
+mk_variable_use(Parser *p, const Tok *t)
+{
+    Py_ssize_t index = var_use(p, t);
+    if (index < 0) return NULL;
+    return mk_variable(p, t, index, NULL);
+}
+
+/* Reserve the place in the order of first appearance of a function being read; the arity is
+ * filled in once its arguments are. Returns the slot, or -1 on failure. */
+static Py_ssize_t
+ev_reserve(Parser *p)
+{
+    if (p->ev_n == p->ev_cap) {
+        Py_ssize_t cap = p->ev_cap ? p->ev_cap * 2 : 32;
+        Ev *ev = (Ev *)PyMem_Realloc(p->events, (size_t)cap * sizeof(Ev));
+        if (ev == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        p->events = ev;
+        p->ev_cap = cap;
+    }
+    p->events[p->ev_n].name = NULL;
+    p->events[p->ev_n].arity = 0;
+    return p->ev_n++;
+}
+
+static void
+ev_fill(Parser *p, Py_ssize_t slot, PyObject *name, Py_ssize_t arity)
+{
+    p->events[slot].name = Py_NewRef(name);
+    p->events[slot].arity = arity;
+}
+
+/* The formula is finished: its symbols as a tuple, in order of first appearance, each added to
+ * the file's table if new. */
+static PyObject *
+end_formula(Parser *p)
+{
+    State *st = S(p);
+    Vec out = {0};
+    PyObject *res = NULL;
+    p->numbering = 0;
+    for (Py_ssize_t i = 0; i < p->ev_n; i++) {
+        Ev *ev = &p->events[i];
+        if (ev->name == NULL) continue;
+        Py_ssize_t klen;
+        const char *key = PyUnicode_AsUTF8AndSize(ev->name, &klen);
+        if (key == NULL) goto done;
+        int added;
+        Py_ssize_t id = htab_intern(&p->symtab, key, klen, ev->arity, &added);
+        if (id < 0) goto done;
+        HEnt *e = &p->symtab.ent[id];
+        if (added) {
+            /* The key points into ev->name, which the new Symbol keeps alive. */
+            PyObject *arity = PyLong_FromSsize_t(ev->arity);
+            if (arity == NULL) goto done;
+            e->obj = mk(st->c_Symbol, 2, st->n_name, ev->name, st->n_arity, arity);
+            Py_DECREF(arity);
+            if (e->obj == NULL) goto done;
+        }
+        if (e->stamp != p->formula_no) {
+            e->stamp = p->formula_no;
+            if (vec_push_new(&out, Py_NewRef(e->obj)) < 0) goto done;
+        }
+    }
+    res = vec_tuple(&out);
+done:
+    ev_clear(p);
+    vec_free(&out);
+    return res;
 }
 
 /* ------------------------------------------------------------------------------------
@@ -954,6 +1263,7 @@ static PyObject *
 tcf_logic_(Parser *p)
 {
     PyObject *variables = NULL, *body = NULL, *res = NULL;
+    Py_ssize_t mark = p->undo_n;
     if (KIND(p) == O_FORALL && PEEK(p, 1)->kind == O_LBRACK) {
         p->i++;
         variables = variable_list(p, L_TFF);
@@ -965,6 +1275,7 @@ tcf_logic_(Parser *p)
     }
     res = cnf_formula(p);
 done:
+    var_release(p, mark);
     Py_XDECREF(variables);
     Py_XDECREF(body);
     return res;
@@ -1262,36 +1573,38 @@ static PyObject *
 variable(Parser *p, Lang lang)
 {
     State *st = S(p);
-    PyObject *text = NULL, *ty = NULL, *res = NULL;
+    PyObject *ty = NULL, *res = NULL;
     const Tok *t = CUR(p);
     if (t->kind != K_UPPER) return fail_expected(p, "a variable");
     p->i++;
-    text = tok_text(p, t);
-    if (text == NULL) goto done;
+    Py_ssize_t index = var_bind(p, t);
+    if (index < 0) return NULL;
     if (lang == L_FOF) {
-        res = mk(st->c_Variable, 1, st->n_name, text);
+        res = mk_variable(p, t, index, NULL);
     }
     else if (lang == L_THF) {
         EXPECT(O_COLON);
+        p->type_depth++;
         ty = thf_unitary(p);
-        if (ty == NULL) goto done;
-        if (KIND(p) == O_GT || KIND(p) == O_STAR || KIND(p) == O_PLUS || KIND(p) == O_AT) {
+        if (ty != NULL &&
+            (KIND(p) == O_GT || KIND(p) == O_STAR || KIND(p) == O_PLUS || KIND(p) == O_AT)) {
             PyObject *full = thf_type_tail(p, ty);
             Py_SETREF(ty, full);
-            if (ty == NULL) goto done;
         }
-        res = mk(st->c_TypedVariable, 2, st->n_name, text, st->n_type, ty);
+        p->type_depth--;
+        if (ty == NULL) goto done;
+        res = mk_variable(p, t, index, ty);
     }
     else if (accept(p, O_COLON)) {
         ty = tff_atomic_type(p);
         if (ty == NULL) goto done;
-        res = mk(st->c_TypedVariable, 2, st->n_name, text, st->n_type, ty);
+        res = mk_variable(p, t, index, ty);
     }
     else {
-        res = mk(st->c_Variable, 1, st->n_name, text);
+        res = mk_variable(p, t, index, NULL);
     }
 done:
-    Py_XDECREF(text);
+    (void)st;
     Py_XDECREF(ty);
     return res;
 }
@@ -1319,6 +1632,7 @@ quantified(Parser *p, Lang lang)
 {
     PyObject *variables = NULL, *body = NULL, *res = NULL;
     int op = KIND(p);
+    Py_ssize_t mark = p->undo_n;
     p->i++;
     variables = variable_list(p, lang);
     if (variables == NULL) goto done;
@@ -1328,6 +1642,7 @@ quantified(Parser *p, Lang lang)
     if (require_formula(p, lang, body, body_start) < 0) goto done;
     res = mk_quantified(p, op, variables, body);
 done:
+    var_release(p, mark);
     Py_XDECREF(variables);
     Py_XDECREF(body);
     return res;
@@ -1603,7 +1918,7 @@ primary_(Parser *p, Lang lang)
 
     if (kind == K_UPPER) {
         p->i++;
-        return mk_word_node(p, st->c_Variable, st->n_name, tok);
+        return mk_variable_use(p, tok);
     }
     if (IS_NUM(kind)) {
         p->i++;
@@ -1621,17 +1936,26 @@ primary_(Parser *p, Lang lang)
         p->i++;
         name_s = word_text(p, tok);
         if (name_s == NULL) goto done;
+        /* Reserve this use's place in the order of first appearance now, and fill in the
+         * arity once the arguments are read. $-symbols are not recorded. */
+        Py_ssize_t slot = -1;
+        if (p->numbering && !p->type_depth && IS_WORD(kind)) {
+            slot = ev_reserve(p);
+            if (slot < 0) goto done;
+        }
         if (accept(p, O_LPAREN)) {
             if (vec_push_new(&args, argument(p, lang)) < 0) goto done;
             while (accept(p, O_COMMA)) {
                 if (vec_push_new(&args, argument(p, lang)) < 0) goto done;
             }
             EXPECT(O_RPAREN);
+            if (slot >= 0) ev_fill(p, slot, name_s, args.n);
             args_t = vec_tuple(&args);
             if (args_t == NULL) goto done;
             res = mk_function(p, name_s, args_t);
             goto done;
         }
+        if (slot >= 0) ev_fill(p, slot, name_s, 0);
         res = mk_function(p, name_s, NULL);
         goto done;
     }
@@ -1694,12 +2018,14 @@ atom_typing_(Parser *p, Lang lang)
     p->i++;
     EXPECT(O_COLON);
     if (lang == L_THF) {
+        p->type_depth++;
         ty = thf_unitary(p);
         if (ty != NULL && (KIND(p) == O_GT || KIND(p) == O_STAR || KIND(p) == O_PLUS ||
                            KIND(p) == O_AT)) {
             PyObject *full = thf_type_tail(p, ty);
             Py_SETREF(ty, full);
         }
+        p->type_depth--;
     }
     else {
         ty = tff_type(p, 0);
@@ -1794,6 +2120,7 @@ tff_type_(Parser *p, int in_parens)
     State *st = S(p);
     PyObject *variables = NULL, *body = NULL, *left = NULL, *right = NULL, *res = NULL;
     Vec args = {0};
+    Py_ssize_t mark = p->undo_n;
 
     if (is_type_quantifier(KIND(p))) {
         int op = KIND(p);
@@ -1838,6 +2165,7 @@ tff_type_(Parser *p, int in_parens)
     }
     res = Py_NewRef(left);
 done:
+    var_release(p, mark);
     Py_XDECREF(variables);
     Py_XDECREF(body);
     Py_XDECREF(left);
@@ -1856,7 +2184,6 @@ tff_type(Parser *p, int in_parens)
 static PyObject *
 tff_type_primary_(Parser *p)
 {
-    State *st = S(p);
     PyObject *inner = NULL, *name_s = NULL, *args_t = NULL, *res = NULL;
     Vec items = {0};
     const Tok *tok = CUR(p);
@@ -1880,7 +2207,7 @@ tff_type_primary_(Parser *p)
     }
     if (tok->kind == K_UPPER) {
         p->i++;
-        return mk_word_node(p, st->c_Variable, st->n_name, tok);
+        return mk_variable_use(p, tok);
     }
     if (tok->kind == K_DEFINED) {
         p->i++;
@@ -1995,7 +2322,7 @@ general_data(Parser *p)
 
     if (kind == K_UPPER) {
         p->i++;
-        return mk_word_node(p, st->c_Variable, st->n_name, tok);
+        return mk_variable_use(p, tok);
     }
     if (IS_NUM(kind)) {
         p->i++;
@@ -2252,7 +2579,7 @@ annotated_formula(Parser *p, int rule)
 {
     State *st = S(p);
     PyObject *nm = NULL, *role_s = NULL, *sub = NULL, *formula = NULL, *source_n = NULL,
-             *info = NULL, *annotations = NULL, *line = NULL, *res = NULL;
+             *info = NULL, *annotations = NULL, *line = NULL, *symbols = NULL, *res = NULL;
     const Tok *start = CUR(p);
     p->i++;
     EXPECT(O_LPAREN);
@@ -2261,8 +2588,11 @@ annotated_formula(Parser *p, int rule)
     EXPECT(O_COMMA);
     if (role(p, &role_s, &sub) < 0) goto done;
     EXPECT(O_COMMA);
+    begin_formula(p);
     formula = run_rule(p, rule);
     if (formula == NULL) goto done;
+    symbols = end_formula(p);
+    if (symbols == NULL) goto done;
     if (accept(p, O_COMMA)) {
         source_n = source(p);
         if (source_n == NULL) goto done;
@@ -2283,10 +2613,11 @@ annotated_formula(Parser *p, int rule)
     EXPECT(O_DOT);
     line = PyLong_FromSsize_t(start->line);
     if (line == NULL) goto done;
-    res = mk(st->c_AnnotatedFormula, 7, st->n_language, st->lang_str[rule], st->n_name, nm,
+    res = mk(st->c_AnnotatedFormula, 8, st->n_language, st->lang_str[rule], st->n_name, nm,
              st->n_role, role_s, st->n_formula, formula, st->n_annotations, annotations,
-             st->n_subrole, sub, st->n_line, line);
+             st->n_subrole, sub, st->n_line, line, st->n_symbols, symbols);
 done:
+    Py_XDECREF(symbols);
     Py_XDECREF(nm);
     Py_XDECREF(role_s);
     Py_XDECREF(sub);
@@ -2361,7 +2692,7 @@ static PyObject *
 parse_file_rule(Parser *p)
 {
     State *st = S(p);
-    PyObject *inputs_t = NULL, *comments_t = NULL, *res = NULL;
+    PyObject *inputs_t = NULL, *comments_t = NULL, *symbols_t = NULL, *res = NULL;
     Vec inputs = {0};
     while (KIND(p) != K_EOF) {
         const Tok *tok = CUR(p);
@@ -2386,12 +2717,17 @@ parse_file_rule(Parser *p)
     }
     inputs_t = vec_tuple(&inputs);
     comments_t = vec_tuple(&p->comments);
-    if (inputs_t == NULL || comments_t == NULL) goto done;
-    res = mk(st->c_TPTPFile, 3, st->n_inputs, inputs_t, st->n_comments, comments_t,
-             st->n_filename, p->filename);
+    symbols_t = PyTuple_New(p->symtab.n);
+    if (inputs_t == NULL || comments_t == NULL || symbols_t == NULL) goto done;
+    for (Py_ssize_t k = 0; k < p->symtab.n; k++) {
+        PyTuple_SET_ITEM(symbols_t, k, Py_NewRef(p->symtab.ent[k].obj));
+    }
+    res = mk(st->c_TPTPFile, 4, st->n_inputs, inputs_t, st->n_comments, comments_t,
+             st->n_filename, p->filename, st->n_symbols, symbols_t);
 done:
     Py_XDECREF(inputs_t);
     Py_XDECREF(comments_t);
+    Py_XDECREF(symbols_t);
     vec_free(&inputs);
     return res;
 }
@@ -2405,6 +2741,11 @@ parser_free(Parser *p)
 {
     PyMem_Free(p->toks);
     vec_free(&p->comments);
+    ev_clear(p);
+    PyMem_Free(p->events);
+    PyMem_Free(p->undo);
+    htab_free(&p->vars);
+    htab_free(&p->symtab);
 }
 
 /* Shared driver. rule < 0 parses a whole file; otherwise a single bare formula. */
@@ -2427,11 +2768,16 @@ run_parser(State *st, PyObject *text, PyObject *filename, int rule)
     }
 
     PyObject *res = NULL;
+    /* The trees built here have no reference cycles, and the garbage collector would walk the
+     * growing tree again and again, which costs about a third of the time. The GIL is held
+     * throughout, so nothing else runs while it is off. */
+    int gc_was_enabled = PyGC_Disable();
     if (lex(&p) < 0) goto done;
     if (rule < 0) {
         res = parse_file_rule(&p);
     }
     else {
+        begin_formula(&p);
         res = run_rule(&p, rule);
         if (res != NULL && KIND(&p) != K_EOF) {
             Py_CLEAR(res);
@@ -2439,6 +2785,7 @@ run_parser(State *st, PyObject *text, PyObject *filename, int rule)
         }
     }
 done:
+    if (gc_was_enabled) PyGC_Enable();
     if (res == NULL && p.too_deep) {
         PyErr_Clear();
         res = Py_NewRef(Py_NotImplemented);

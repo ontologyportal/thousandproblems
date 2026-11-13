@@ -745,6 +745,204 @@ class Operators(unittest.TestCase):
         self.assertIn("Or(", repr(node.body.right))
 
 
+def variables_of(node):
+    """``(name, index)`` of every variable in the tree, in order, binders included."""
+    return [(v.name, v.index) for v in tptp.walk(node) if isinstance(v, (Variable, TypedVariable))]
+
+
+class VariableIndexes(unittest.TestCase):
+    def test_the_documented_example(self):
+        clause = tptp.parse("cnf(c,axiom,f(X) | f(Y) | g(X, f(Y))).").formulae[0].formula
+        self.assertEqual(variables_of(clause), [("X", 1), ("Y", 2), ("X", 1), ("Y", 2)])
+
+    def test_numbered_by_first_appearance_from_one(self):
+        clause = tptp.parse_formula("p(Z, X, Y, X, Z, W)", "cnf")
+        self.assertEqual(variables_of(clause), [("Z", 1), ("X", 2), ("Y", 3), ("X", 2), ("Z", 1), ("W", 4)])
+
+    def test_numbering_restarts_for_each_formula(self):
+        file = tptp.parse("cnf(a,axiom,p(X,Y)). cnf(b,axiom,q(Y,X)). fof(c,axiom,r(Z)).")
+        self.assertEqual([variables_of(f.formula) for f in file.formulae],
+                         [[("X", 1), ("Y", 2)], [("Y", 1), ("X", 2)], [("Z", 1)]])
+
+    def test_equal_variables_share_an_index_and_equality_ignores_it(self):
+        a, b = tptp.parse_formula("p(X, Y, X)", "cnf").args[::2]
+        self.assertEqual((a.index, b.index), (1, 1))
+        self.assertEqual(tptp.parse_formula("p(X, Y)"), Function("p", (Variable("X"), Variable("Y"))))
+        self.assertEqual(Variable("X"), Variable("X", 7))
+        self.assertEqual(hash(Variable("X")), hash(Variable("X", 7)))
+
+    def test_not_in_a_formula_means_zero(self):
+        self.assertEqual(Variable("X").index, 0)
+        self.assertEqual(TypedVariable("X", Function("$i")).index, 0)
+
+    def test_quantifier_binders_come_first_and_in_binder_order(self):
+        self.assertEqual(variables_of(tptp.parse_formula("! [Y,X] : p(X,Y)")),
+                         [("Y", 1), ("X", 2), ("X", 2), ("Y", 1)])
+
+    def test_each_binding_is_its_own_variable(self):
+        self.assertEqual(variables_of(tptp.parse_formula("(! [X] : p(X)) & (? [X] : q(X))")),
+                         [("X", 1), ("X", 1), ("X", 2), ("X", 2)])
+
+    def test_shadowing_and_the_outer_variable_coming_back(self):
+        self.assertEqual(variables_of(tptp.parse_formula("! [X] : ((! [X] : q(X)) & p(X))")),
+                         [("X", 1), ("X", 2), ("X", 2), ("X", 1)])
+
+    def test_free_variable_and_a_binder_with_the_same_name(self):
+        self.assertEqual(variables_of(tptp.parse_formula("p(Y) & ! [Y] : q(Y) & r(Y)")),
+                         [("Y", 1), ("Y", 2), ("Y", 2), ("Y", 1)])
+
+    def test_free_variable_met_inside_a_scope_keeps_its_index_outside(self):
+        self.assertEqual(variables_of(tptp.parse_formula("(! [X] : p(X,Y)) & q(Y,X)")),
+                         [("X", 1), ("X", 1), ("Y", 2), ("Y", 2), ("X", 3)])
+
+    def test_typed_binders(self):
+        node = tptp.parse_formula("! [X: $int, Y] : p(X,Y)", "tff")
+        self.assertEqual(variables_of(node), [("X", 1), ("Y", 2), ("X", 1), ("Y", 2)])
+        self.assertIsInstance(node.variables[0], TypedVariable)
+        self.assertEqual(node.variables[0].index, 1)
+
+    def test_thf_binders_and_lambdas(self):
+        node = tptp.parse_formula("^ [X: $i, Y: $i > $o] : (Y @ X)", "thf")
+        self.assertEqual(variables_of(node), [("X", 1), ("Y", 2), ("Y", 2), ("X", 1)])
+
+    def test_type_variables(self):
+        file = tptp.parse("tff(l,type,l: !> [A: $tType, B: $tType] : (A > B)).")
+        self.assertEqual(variables_of(file.formulae[0].formula), [("A", 1), ("B", 2), ("A", 1), ("B", 2)])
+
+    def test_tcf_quantifier(self):
+        self.assertEqual(variables_of(tptp.parse_formula("! [X: $int, Y] : p(Y,X) | q(Z)", "tcf")),
+                         [("X", 1), ("Y", 2), ("Y", 2), ("X", 1), ("Z", 3)])
+
+    def test_let_and_sequents(self):
+        self.assertEqual(variables_of(tptp.parse_formula("$let(f: $i > $i, f(X) := X, p(f(Y)))", "tff")),
+                         [("X", 1), ("X", 1), ("Y", 2)])
+        self.assertEqual(variables_of(tptp.parse_formula("[p(X)] --> [q(Y), r(X)]")),
+                         [("X", 1), ("Y", 2), ("X", 1)])
+
+    def test_variables_in_annotations_are_not_numbered(self):
+        f = tptp.parse("fof(a,plain,p(X,Y),inference(r,[bind(Y,$fot(g(Z)))],[c1:[bind(X,W)]]),[u(V)]).").formulae[0]
+        self.assertEqual(variables_of(f.formula), [("X", 1), ("Y", 2)])
+        self.assertEqual({i for _, i in variables_of(f.annotations)}, {0})
+        self.assertTrue(variables_of(f.annotations))
+
+    def test_numbering_survives_printing_and_reparsing(self):
+        for text in ["p(X) | q(Y,X) | r(Z)", "! [Y,X] : (p(X) & ! [X] : q(X,Y))"]:
+            first = tptp.parse_formula(text)
+            self.assertEqual(variables_of(tptp.parse_formula(str(first))), variables_of(first))
+
+    def test_copy_and_pickle_keep_the_index(self):
+        import copy, pickle
+        node = tptp.parse_formula("! [Y,X] : p(X,Y)")
+        for clone in (copy.deepcopy(node), pickle.loads(pickle.dumps(node))):
+            self.assertEqual(variables_of(clone), variables_of(node))
+
+    def test_many_variables_in_one_clause(self):
+        clause = tptp.parse_formula(" | ".join(f"p(V{i}, V{i % 7})" for i in range(2000)), "cnf")
+        indexes = {v.name: v.index for v in tptp.walk(clause) if isinstance(v, Variable)}
+        self.assertEqual(indexes["V0"], 1)
+        self.assertEqual(sorted(indexes.values()), list(range(1, 2001)))
+
+
+def table(text):
+    return [str(s) for s in tptp.parse(text).symbols]
+
+
+class SymbolTable(unittest.TestCase):
+    def test_functions_constants_and_predicates_in_order_of_first_appearance(self):
+        # f is met before g, a and b, although it is only finished after them
+        self.assertEqual(table("cnf(c,axiom,p(f(g(a),b)) | ~ q)."), ["p/1", "f/2", "g/1", "a/0", "b/0", "q/0"])
+
+    def test_a_symbol_is_a_name_and_an_arity(self):
+        symbols = tptp.parse("cnf(c,axiom,f(a) | f(a,b) | f | g(f(a))).").symbols
+        self.assertEqual([str(s) for s in symbols], ["f/1", "a/0", "f/2", "b/0", "f/0", "g/1"])
+        self.assertEqual(len(set(symbols)), len(symbols))
+        self.assertEqual(symbols[0], tptp.Symbol("f", 1))
+        self.assertEqual((symbols[2].name, symbols[2].arity), ("f", 2))
+
+    def test_each_symbol_once_however_often_it_is_used(self):
+        self.assertEqual(table("cnf(a,axiom,p(a,X)). cnf(b,axiom,p(b,Y) | p(a,a)). fof(c,axiom,q(a))."),
+                         ["p/2", "a/0", "b/0", "q/1"])
+
+    def test_symbols_of_each_formula_and_of_the_file(self):
+        file = tptp.parse("cnf(a,axiom,p(a)). cnf(b,axiom,q(b) | p(a)). cnf(c,axiom,r).")
+        self.assertEqual([[str(s) for s in f.symbols] for f in file.formulae],
+                         [["p/1", "a/0"], ["q/1", "b/0", "p/1", "a/0"], ["r/0"]])
+        self.assertEqual([str(s) for s in file.symbols], ["p/1", "a/0", "q/1", "b/0", "r/0"])
+
+    def test_the_same_symbol_is_the_same_object(self):
+        file = tptp.parse("cnf(a,axiom,p(a)). cnf(b,axiom,p(a)).")
+        self.assertIs(file.formulae[0].symbols[0], file.formulae[1].symbols[0])
+        self.assertIs(file.symbols[0], file.formulae[0].symbols[0])
+
+    def test_defined_and_system_symbols_are_left_out(self):
+        self.assertEqual(table("tff(a,axiom,p($sum(1,2),$$sys(x)) & $less(a,3) & $true)."), ["p/2", "x/0", "a/0"])
+
+    def test_quotes_are_normalised(self):
+        self.assertEqual(table("fof(a,axiom,p('cat') & p(cat) & 'Cat' & '$x')."), ["p/1", "cat/0", "'Cat'/0", "'$x'/0"])
+
+    def test_equality_numbers_and_distinct_objects_are_not_symbols(self):
+        self.assertEqual(table('fof(a,axiom,f(X) = 1 & "obj" != g(2.5, a)).'), ["f/1", "g/2", "a/0"])
+
+    def test_variables_are_not_symbols(self):
+        self.assertEqual(table("cnf(a,axiom,p(X,f(Y)))."), ["p/2", "f/1"])
+
+    def test_quantifiers_and_connectives(self):
+        self.assertEqual(table("fof(a,axiom,! [X] : (p(X) => ? [Y] : (q(X,Y) <=> ~ r)))."), ["p/1", "q/2", "r/0"])
+
+    def test_type_declarations_are_not_symbols_but_uses_are(self):
+        file = tptp.parse("tff(t1,type,s: $tType). tff(t2,type,f: s > s). tff(t3,type,c: s). "
+                          "tff(a,axiom,! [X: s] : f(c) = X).")
+        self.assertEqual(table_of(file), ["f/1", "c/0"])
+        self.assertEqual(file.formulae[0].symbols, ())
+
+    def test_typed_binders_and_type_applications_are_not_symbols(self):
+        self.assertEqual(table("tff(a,axiom,! [X: list(elem), Y: $int] : p(X,Y))."), ["p/2"])
+        self.assertEqual(table("tff(a,type,l: !> [A: $tType] : (list(A) > A))."), [])
+
+    def test_thf_types_are_not_symbols(self):
+        self.assertEqual(table("thf(t,type,f: ind > ind). thf(a,axiom,! [X: ind > bool, Y: ind] : (X @ (f @ Y)))."),
+                         ["f/0"])
+        self.assertEqual(table("thf(a,axiom,^ [X: set(ind)] : p)."), ["p/0"])
+
+    def test_let_definitions_are_uses(self):
+        self.assertEqual(table("tff(a,axiom,$let(f: $i > $i, f(X) := g(X), p(f(a))))."), ["f/1", "g/1", "p/1", "a/0"])
+
+    def test_annotations_are_not_symbols(self):
+        file = tptp.parse("fof(a,plain,p(c),inference(res,[status(thm),k(Z)],[b1,file('f.p',x)]),[source(s),$fot(h(d))]).")
+        self.assertEqual(table_of(file), ["p/1", "c/0"])
+
+    def test_includes_you_did_not_expand_contribute_nothing(self):
+        self.assertEqual(table("include('Axioms/X.ax'). cnf(a,axiom,p)."), ["p/0"])
+        self.assertEqual(tptp.parse("").symbols, ())
+
+    def test_the_symbol_table_follows_include_expansion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "ax.ax").write_text("cnf(x1,axiom,ax1(a)). cnf(x2,axiom,ax2(b)). cnf(x3,axiom,ax3).")
+            Path(tmp, "all.p").write_text("cnf(m1,axiom,m(a)). include('ax.ax'). cnf(m2,axiom,n).")
+            Path(tmp, "some.p").write_text("include('ax.ax',[x2]). cnf(m2,axiom,n(c)).")
+            self.assertEqual(table_of(tptp.parse_file(Path(tmp, "all.p"))), ["m/1", "a/0", "n/0"])
+            self.assertEqual(table_of(tptp.parse_file(Path(tmp, "all.p"), expand_includes=True)),
+                             ["m/1", "a/0", "ax1/1", "ax2/1", "b/0", "ax3/0", "n/0"])
+            # selecting only x2 must leave the other formulae's symbols out
+            self.assertEqual(table_of(tptp.parse_file(Path(tmp, "some.p"), expand_includes=True)),
+                             ["ax2/1", "b/0", "n/1", "c/0"])
+
+    def test_str_and_repr(self):
+        symbol = tptp.Symbol("f", 2)
+        self.assertEqual(str(symbol), "f/2")
+        self.assertEqual(repr(symbol), "Symbol(name='f', arity=2)")
+
+    def test_a_long_clause(self):
+        clause = " | ".join(f"p{i}(a)" for i in range(30_000))
+        symbols = tptp.parse(f"cnf(c,axiom,{clause}).").symbols
+        self.assertEqual(len(symbols), 30_001)
+        self.assertEqual((str(symbols[0]), str(symbols[1])), ("p0/1", "a/0"))
+
+
+def table_of(file):
+    return [str(s) for s in file.symbols]
+
+
 class Api(unittest.TestCase):
     def test_parse_formula_rejects_trailing_input(self):
         with self.assertRaises(ParseError):

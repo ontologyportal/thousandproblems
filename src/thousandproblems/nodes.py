@@ -18,7 +18,7 @@ __all__ = [
     "Comment", "ConnectiveTerm", "DistinctObject", "FileSource", "FormulaData", "Function", "Header", "Include", "Index",
     "Inference", "Introduced", "Let", "LongConnective", "ModalAtom", "NAry", "Name",
     "Node", "Number", "ParseError", "Parent", "Quantified", "SourceList", "TPTPFile",
-    "Tuple", "TypedVariable", "Typing", "Unary", "Variable",
+    "Symbol", "Tuple", "TypedVariable", "Typing", "Unary", "Variable",
     "unquote", "walk",
 ]
 
@@ -87,7 +87,20 @@ def _specialise(cls: type, base: type, table: dict, key: str, args: tuple, kwarg
 
 @dataclass(frozen=True, slots=True)
 class Variable(Node):
+    """A variable.
+
+    ``index`` numbers the distinct variables of one formula 1, 2, 3 ... in order of first
+    appearance, so in ``f(X) | f(Y) | g(X, f(Y))`` every ``X`` has index 1 and every ``Y``
+    index 2. A quantifier counts as the first appearance of the variables it binds, and each
+    binding is its own variable: in ``(! [X] : p(X)) & (! [X] : q(X))`` the two ``X`` have
+    indexes 1 and 2. Numbering starts again for each formula. A variable that does not belong
+    to a formula (one in an annotation, or built by hand) has index 0.
+
+    ``index`` is not compared: ``Variable('X') == Variable('X', 1)``.
+    """
+
     name: str
+    index: int = field(default=0, compare=False)
 
     def _tptp(self) -> str:
         return self.name
@@ -223,8 +236,11 @@ class NAry(Node):
 
 @dataclass(frozen=True, slots=True)
 class TypedVariable(Node):
+    """A bound variable with a type, ``X: $int``. ``index`` is as for :class:`Variable`."""
+
     name: str
     type: Node
+    index: int = field(default=0, compare=False)
 
     def _tptp(self) -> str:
         return f"{self.name}: {self.type._tptp()}"
@@ -463,6 +479,21 @@ class Annotations(Node):
 
 
 @dataclass(frozen=True, slots=True)
+class Symbol:
+    """A function, constant or predicate symbol: its name and its arity.
+
+    ``f/1`` and ``f/2`` are different symbols, and a constant is a symbol of arity 0.
+    ``str(symbol)`` is ``'f/2'``.
+    """
+
+    name: str
+    arity: int
+
+    def __str__(self) -> str:
+        return f"{self.name}/{self.arity}"
+
+
+@dataclass(frozen=True, slots=True)
 class AnnotatedFormula(Node):
     language: str
     name: str
@@ -471,6 +502,8 @@ class AnnotatedFormula(Node):
     annotations: Optional[Annotations] = None
     subrole: Optional[Node] = None  # the term in role-term
     line: int = field(default=0, compare=False, repr=False)
+    #: The symbols this formula uses, in order of first appearance.
+    symbols: tuple[Symbol, ...] = field(default=(), compare=False, repr=False)
 
     def _tptp(self) -> str:
         role = self.role if self.subrole is None else f"{self.role}-{self.subrole._tptp()}"
@@ -600,6 +633,9 @@ class TPTPFile(Node):
     inputs: tuple[Union[AnnotatedFormula, Include], ...] = ()
     comments: tuple[Comment, ...] = ()
     filename: Optional[str] = field(default=None, compare=False)
+    #: The symbol table: every symbol the formulae use, in order of first appearance.
+    #: See :class:`Symbol` for what counts.
+    symbols: tuple[Symbol, ...] = field(default=(), compare=False, repr=False)
 
     @property
     def formulae(self) -> tuple[AnnotatedFormula, ...]:
@@ -624,6 +660,14 @@ class TPTPFile(Node):
 
     def _tptp(self) -> str:
         return "\n".join([i._tptp() for i in self.inputs])
+
+
+def _symbol_table(formulae) -> tuple[Symbol, ...]:
+    """The symbol table of some formulae: their symbols, each once, in order of first appearance."""
+    seen: dict[Symbol, None] = {}
+    for formula in formulae:
+        seen.update(dict.fromkeys(formula.symbols))
+    return tuple(seen)
 
 
 _ATOMIC = (Variable, Function, Number, DistinctObject, Tuple, ConnectiveTerm,
