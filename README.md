@@ -128,6 +128,143 @@ tarball. For anything more than a handful of problems, download the library.
 Reading a compressed tarball means decompressing up to each file, so unpack it
 (and use the folder) if you will read many problems.
 
+## Command line
+
+Installing the package adds a `thousandproblems` command (`python -m thousandproblems` works
+too). Commands that need a library take `-L/--library` with a folder, a tarball or a server
+URL. Without it they use the folder named by `$TPTP`, and `fetch` and `stats` fall back to the
+TPTP website.
+
+```sh
+# the whole library (about 1 GB): the latest release, or --version 9.0.0; --list shows them all
+thousandproblems download -o ~/tptp            # prints e.g. ~/tptp/TPTP-v10.0.0
+export TPTP=~/tptp/TPTP-v10.0.0
+
+# a few problems, with the axiom files they include, saved in the standard layout
+thousandproblems fetch SET001-1 'SEU14*' -o problems/
+thousandproblems fetch SET001-1 --expand       # print it, includes replaced by their formulae
+
+# already have a library somewhere? find it, and set $TPTP for new terminals
+thousandproblems discover ~/datasets --set
+
+# is this a usable TPTP library? (exit status 1 if not)
+thousandproblems validate ~/tptp/TPTP-v10.0.0 --includes
+
+# where is it?
+thousandproblems find SET001-1 'SYO00?^1' SET001-0.ax
+
+# dialect, status, symbols, variables ...
+thousandproblems stats SET001-1
+thousandproblems stats my_problem.p --symbols --json
+```
+
+`validate` checks the standard layout: the `Problems/` and `Axioms/` folders, three-letter
+domain folders, and problem files named after their domain. `--includes` checks that every
+include can be found, and `--parse` also parses every file (slow). A missing `Documents/`,
+`Generators/`, `Scripts/` or `TPTP2X/` folder is only a warning, since a trimmed copy still
+works; `--strict` makes warnings fail too.
+
+`discover` looks for libraries: folders holding `Problems/` and `Axioms/`, searched four levels
+deep (`--depth`) under the folders you name, or by default under the current folder, your home
+folder, `/opt`, `/usr/local/share`, `/usr/share`, `/srv` and `/data`. It checks each one,
+lists them (usable ones first, then newest), and prints the command that sets `$TPTP` for your
+shell (`--shell bash|zsh|fish|sh|powershell|cmd` to choose another). With `--set`, or when you
+say yes at the prompt, it adds that command to your shell's startup file (`~/.zshrc`,
+`~/.bashrc`, or `~/.bash_profile` on macOS, a `conf.d` file for fish, `~/.profile` otherwise)
+between marker comments, so running it again replaces that line rather than adding another.
+On Windows it runs `setx` instead. Without a terminal, `--set` also needs `--yes`. A program
+can't change the environment of the shell that started it, so the current terminal still needs
+the printed command, or a new window.
+
+`stats` shows the figures it works out from the formulae (with the included axioms, unless you
+pass `--no-expand`) next to the `% Syntax` statistics that the TPTP header declares:
+
+```
+Problem        : SET001-1  (Problems/SET/SET001-1.p)
+Domain         : SET  Set Theory
+Title          : Set members are superset members
+Status         : Unsatisfiable
+Rating         : 0.11  (v10.0.0)
+SPC            : CNF_UNS_RFO_NEQ_NHN  (clause normal form, Unsatisfiable, real first-order, no equality, non-Horn)
+Dialect        : cnf  [CNF]
+Formulae       : 9  (6 axiom, 2 hypothesis, 1 negated_conjecture)
+Unit formulae  : 3
+Atoms          : 17  (0 equality)
+Symbols        : 7  (arity 0-2)
+  predicates   : 3  (arity 2-2)
+  functions    : 1  (arity 2-2)
+  constants    : 3  (arity 0-0)
+Variables      : 13  (bound: 13 !)  (0 singleton)
+
+Declared in the header (% Syntax), covering the problem with its includes:
+  clauses          :      9  (3 unt; 1 nHn; 8 RR)
+  literals         :     17  (0 equ; 8 neg)
+  ...
+```
+
+### Keeping up with new TPTP releases
+
+The website only serves the current release, so problems cached from it go out of date when a
+new release comes out. `thousandproblems refresh` looks up the latest release on tptp.org,
+deletes cached downloads that come from an older one (they are fetched again when next
+needed), and compares your local library (`-L` or `$TPTP`) with the latest release.
+`--index` also rebuilds the search index.
+
+```
+$ thousandproblems refresh
+latest TPTP release : v10.0.0
+online cache        : held v9.3.0; cleared 12 files, so problems are fetched again from v10.0.0
+local library       : /data/TPTP-v9.3.0 is v9.3.0; get v10.0.0 with 'thousandproblems download'
+```
+
+If you haven't checked for 30 days, the next command asks first:
+
+```
+You have not checked for a new TPTP library version in 30 days, check now? [y]es / [n]o / [s]nooze for thirty days:
+```
+
+`n` asks again the next day and `s` waits another 30 days. Without a terminal (in scripts and
+pipelines) you get a one-line warning on stderr instead, at most once a day. Set
+`THOUSANDPROBLEMS_NO_UPDATE_CHECK=1` to turn the reminder off, e.g. in CI. The time of the last
+check is kept in `state.json` in the cache directory, and the version the online cache holds
+in a `VERSION` file next to the cached files.
+
+### Searching by problem properties (TPTP2T)
+
+`search` covers the problem-properties part of the [TPTP2T](https://tptp.org/cgi-bin/TPTP2T)
+form, run offline against a local library: domain, logical form, first-order subform, problem
+version, status, rating, numbers of formulae, unit formulae, atoms, types, datatypes,
+codatatypes, symbols, predicates, functions, the arities, equality, unit equality, variables
+and binders, and arithmetic.
+
+```sh
+thousandproblems search --form FOF --status THM --rating 0.5..1 --equality none
+thousandproblems search --domain SET,SEU --form THF --format table
+thousandproblems search --form not:CNF --predicates '>1' --function-arity 0 --count
+thousandproblems search --form TF0 --arithmetic yes | thousandproblems fetch - -o out/
+```
+
+Lists are comma-separated and match any item. Numbers take `N`, `MIN..MAX`, `MIN..`, `..MAX`,
+`>N`, `>=N`, `<N` or `<=N`, and `not:` negates a criterion like TPTP2T's `~` box. All
+criteria must hold. `thousandproblems search --help` lists them all. The answers come from the
+problem headers (`% SPC`, `% Status`, `% Rating`, `% Version` and `% Syntax`), which are
+indexed on first use (a couple of seconds for a folder; a tarball has to be decompressed once)
+and cached in `$THOUSANDPROBLEMS_CACHE` until the library changes. TPTP2T's *solution*
+properties (which systems solved a problem, and how) come from the TSTP solution library, not
+the problem library, so `search` does not offer them.
+
+The same is available from Python:
+
+```python
+from thousandproblems.search import search
+for record in search("/data/TPTP-v10.0.0", form="FOF", status="THM", rating="unsolved"):
+    print(record.name, record.rating, record.stat("formulae"))
+```
+
+`thousandproblems.stats` (`compute_stats`, `syntax_stats`, `SPC`),
+`thousandproblems.validate.validate_library` and `thousandproblems.download.download_library`
+are the other building blocks the commands use.
+
 ## Which parser is running?
 
 ```python

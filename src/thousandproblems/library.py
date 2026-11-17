@@ -160,6 +160,40 @@ class Library:
         """The names of the problems in the library, sorted; optionally only one domain."""
         raise NotImplementedError(f"{type(self).__name__} cannot list its problems")
 
+    def problem_files(self, name: str) -> dict[str, str]:
+        """Problem ``name`` and every file it includes, directly or not, as
+        ``{library path: text}`` with the problem first, e.g.
+        ``{'Problems/SET/SET001-1.p': ..., 'Axioms/SET001-0.ax': ...}``.
+
+        Includes are found the same way as by :meth:`problem`; one that cannot be found
+        raises :class:`ProblemNotFound`.
+        """
+        from . import parse
+
+        path = problem_path(name)
+        try:
+            files = {path: self.read(path)}
+        except ProblemNotFound:
+            raise ProblemNotFound(f"problem {name!r} is not in {self.label}") from None
+        todo = [path]
+        while todo:
+            current = todo.pop()
+            for item in parse(files[current], current).includes:
+                for candidate in (item.path, posixpath.join(posixpath.dirname(current), item.path)):
+                    clean = _clean(candidate)
+                    if clean is None:
+                        continue
+                    if clean in files:
+                        break
+                    text = self.read_optional(clean)
+                    if text is not None:
+                        files[clean] = text
+                        todo.append(clean)
+                        break
+                else:
+                    raise ProblemNotFound(f"{current} includes {item.path!r}, which is not in {self.label}")
+        return files
+
     def close(self) -> None:
         """Release any open files."""
 
