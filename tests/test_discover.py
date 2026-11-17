@@ -150,6 +150,11 @@ class Shells(Base):
 class Command(Base):
     def setUp(self):
         super().setUp()
+        # detect_shell() ignores $SHELL on Windows (it picks powershell/cmd), so pin it
+        # here; tests that want another shell pass --shell explicitly.
+        shell = mock.patch.object(discover, "detect_shell", return_value="zsh")
+        shell.start()
+        self.addCleanup(shell.stop)
         self.lib = write_tree(self.search / "TPTP-v10.0.0")
 
     def interactive(self, *argv, answers=""):
