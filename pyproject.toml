@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "thousandproblems"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fast parser and printer for the TPTP problem and solution syntax (thf, tff, tcf, fof, cnf, tpi)."
 readme = "README.md"
 requires-python = ">=3.11"
