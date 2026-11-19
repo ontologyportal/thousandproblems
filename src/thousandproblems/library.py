@@ -168,13 +168,17 @@ class Library:
         Includes are found the same way as by :meth:`problem`; one that cannot be found
         raises :class:`ProblemNotFound`.
         """
-        from . import parse
-
         path = problem_path(name)
         try:
             files = {path: self.read(path)}
         except ProblemNotFound:
             raise ProblemNotFound(f"problem {name!r} is not in {self.label}") from None
+        return self._with_includes(path, files)
+
+    def _with_includes(self, path: str, files: dict[str, str]) -> dict[str, str]:
+        """``files`` (holding the file at ``path``) plus every file it includes, directly or not."""
+        from . import parse
+
         todo = [path]
         while todo:
             current = todo.pop()

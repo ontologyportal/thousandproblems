@@ -326,7 +326,7 @@ class ReadHeader(unittest.TestCase):
 
 class SearchTests(TempCase):
     def names(self, **criteria):
-        return [r.name for r in search.search(self.root, **criteria)]
+        return search.search(self.root, **criteria).names
 
     def test_everything(self):
         self.assertEqual(self.names(), ["DAT001_1", "PUZ001+1", "SET001-1", "SYO001^1"])
@@ -379,7 +379,7 @@ class SearchTests(TempCase):
         records = search.build_index(self.root)
         for label, (criteria, expected) in cases.items():
             with self.subTest(label):
-                self.assertEqual([r.name for r in search.search(records, **criteria)], expected)
+                self.assertEqual(search.search(records, **criteria).names, expected)
 
     def test_bad_values(self):
         for criteria in (dict(form="XYZ"), dict(status="nope"), dict(equality="lots"),

@@ -3,8 +3,13 @@
     >>> from thousandproblems.search import search                         # doctest: +SKIP
     >>> hits = search("/data/TPTP-v10.0.0", form="FOF", status="THM",
     ...               equality="none", rating="0.5..1", formulae="..50")   # doctest: +SKIP
-    >>> [r.name for r in hits][:3]                                         # doctest: +SKIP
+    >>> hits.names[:3]                                                     # doctest: +SKIP
     ['AGT001+1', 'AGT001+2', 'AGT002+1']
+    >>> for problem in hits:        # fetches one problem at a time        # doctest: +SKIP
+    ...     print(problem.name, len(problem.parsed().formulae))
+
+A search returns a :class:`SearchResult`: the names of the problems found, the criteria and
+library they came from, and an iterator that fetches each problem only when you reach it.
 
 Everything TPTP2T matches on comes from the problem headers: the ``% SPC`` line (logical
 form, status, order, equality, arithmetic ...), the ``% Rating`` line, the ``% Version`` line
@@ -34,14 +39,15 @@ import re
 import tarfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional, Union
+from typing import Any, Callable, Iterable, Iterator, Optional, Union, overload
 
 from .library import (DirectoryLibrary, Library, LibraryError, TarballLibrary, _NAME_RE,
                       default_cache_dir, open_library)
 from .nodes import Comment, Header, _parse_header
+from .problem import Problem
 from .stats import SPC, STATUS_CODES, syntax_stats
 
-__all__ = ["ProblemRecord", "Query", "build_index", "read_header", "search", "CRITERIA"]
+__all__ = ["Problem", "ProblemRecord", "Query", "SearchResult", "build_index", "read_header", "search", "CRITERIA"]
 
 _INDEX_FORMAT = 1
 
@@ -534,16 +540,122 @@ class Query:
         return bool(self.tests)
 
 
+class SearchResult:
+    """The outcome of a :func:`search`.
+
+    * ``params``: the criteria searched for, as ``{name: [value, ...]}``, e.g. ``{"form": ["FOF"]}``;
+    * ``source``: where the problems are, as a label (the library's folder, tarball or URL), or
+      ``None`` if the search was run over a list of records of unknown origin;
+    * ``names``: the names of the problems found, sorted; ``records`` holds what the index knows
+      about each (status, rating, statistics ...), without fetching the problems;
+    * ``searched``: how many problems were searched.
+
+    Iterating gives a :class:`~thousandproblems.problem.Problem` for each name, fetched from the
+    library at that moment, so a large result is never held in memory. ``result[3]`` fetches one,
+    ``result[:10]`` is a smaller :class:`SearchResult`, and ``len(result)`` is the number of
+    problems. Use it in a ``with`` block, or call :meth:`close`, to release a tarball it opened.
+    """
+
+    def __init__(self, records: list[ProblemRecord], *, params: Optional[dict[str, list[str]]] = None,
+                 source: Optional[str] = None, library: Optional[Library] = None, searched: Optional[int] = None,
+                 owns_library: bool = False):
+        self.records = records
+        self.params = params if params is not None else {}
+        self.source = source
+        self.searched = len(records) if searched is None else searched
+        self._library = library
+        self._owns_library = owns_library
+        self._by_name: Optional[dict[str, ProblemRecord]] = None
+
+    @property
+    def names(self) -> list[str]:
+        return [r.name for r in self.records]
+
+    @property
+    def library(self) -> Library:
+        """The library the problems are fetched from."""
+        if self._library is None:
+            raise LibraryError("this search result has no library to fetch problems from "
+                               "(it was searched from a list of records; pass source=...)")
+        return self._library
+
+    def problem(self, name: str) -> Problem:
+        """Fetch problem ``name``, which must be one of :attr:`names`."""
+        if self._by_name is None:
+            self._by_name = {r.name: r for r in self.records}
+        if name not in self._by_name:
+            raise KeyError(f"{name!r} is not in this search result")
+        return Problem.from_library(name, self.library, self._by_name[name])
+
+    def __iter__(self) -> Iterator[Problem]:
+        library = self.library
+        for record in self.records:
+            yield Problem.from_library(record.name, library, record)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    @overload
+    def __getitem__(self, index: int) -> Problem: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> "SearchResult": ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return SearchResult(self.records[index], params=self.params, source=self.source,
+                                library=self._library, searched=self.searched)
+        return self.problem(self.records[index].name)
+
+    def close(self) -> None:
+        """Release the library, if this result opened it."""
+        if self._owns_library and self._library is not None:
+            self._library.close()
+
+    def __enter__(self) -> "SearchResult":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"source": self.source, "params": self.params, "searched": self.searched, "problems": self.names}
+
+    def __repr__(self) -> str:
+        return f"<SearchResult {len(self)} of {self.searched} problems in {self.source or '?'}, params={self.params}>"
+
+
 def search(library: Union[str, os.PathLike, Library, None, list[ProblemRecord]] = None, *,
-           query: Optional[Query] = None, refresh: bool = False, **criteria: Optional[str]) -> list[ProblemRecord]:
-    """The problems of a local library that meet every criterion, sorted by name.
+           query: Optional[Query] = None, refresh: bool = False,
+           progress: Optional[Callable[[int, Optional[int]], None]] = None,
+           source: Union[str, os.PathLike, Library, None] = None, **criteria: Optional[str]) -> SearchResult:
+    """The problems of a local library that meet every criterion, as a :class:`SearchResult`.
 
     ``library`` is as for :func:`thousandproblems.open_library`, or a list of records from
-    :func:`build_index`. Criteria are keyword arguments (see :data:`CRITERIA`), or a prebuilt
-    :class:`Query`.
+    :func:`build_index`, in which case ``source`` says where the problems can be fetched from.
+    Criteria are keyword arguments (see :data:`CRITERIA`), or a prebuilt :class:`Query`.
+    ``progress(done, total)`` reports the indexing of a library seen for the first time.
     """
-    records = library if isinstance(library, list) else build_index(library, refresh=refresh)
+    lib: Optional[Library]
+    if isinstance(library, list):
+        records = library
+        lib = open_library(source) if source is not None else None
+        owned = lib is not source
+    else:
+        lib = open_library(library)
+        owned = lib is not library
+        try:
+            records = build_index(lib, refresh=refresh, progress=progress)
+        except BaseException:
+            if owned:
+                lib.close()
+            raise
     q = query or Query()
     if criteria:
         q = Query(list(q.tests) + Query.build(**criteria).tests)
-    return [r for r in records if q.matches(r)]
+    params: dict[str, list[str]] = {}
+    for key, value, _, _ in q.tests:
+        params.setdefault(key, []).append(value)
+    return SearchResult([r for r in records if q.matches(r)], params=params,
+                        source=lib.label if lib is not None else None, library=lib, searched=len(records),
+                        owns_library=owned)

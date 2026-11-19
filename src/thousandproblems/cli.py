@@ -9,6 +9,8 @@ Subcommands::
     find       locate problems or axiom files in a local library
     stats      print statistics about a problem: dialect, symbols, variables ...
     search     find problems by their properties, like TPTP2T on tptp.org
+    run        run problems (by name, or found by a search) against theorem provers
+    install    download (or build) a theorem prover for use with 'run'
     refresh    check for a new TPTP release and clear outdated cached downloads
 
 Commands that need a library take ``-L/--library`` (a folder, a tarball or a server URL).
@@ -22,6 +24,7 @@ import argparse
 import fnmatch
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
@@ -426,8 +429,8 @@ def _wrap(items: Sequence[str], width: int = 88, indent: str = "    ") -> str:
 # ---------------------------------------------------------------------------------
 
 
-def cmd_search(args) -> int:
-    from .search import CRITERIA, Query, build_index
+def _query(args):
+    from .search import CRITERIA, Query
 
     query = Query()
     try:
@@ -436,52 +439,189 @@ def cmd_search(args) -> int:
                 query.add(name, value)
     except ValueError as e:
         raise CommandError(str(e)) from None
-    source = args.library
-    if source is None and not os.environ.get("TPTP"):
+    return query
+
+
+def _search(args, query):
+    """Search the local library; a SearchResult."""
+    from .search import search
+
+    if args.library is None and not os.environ.get("TPTP"):
         raise CommandError("no TPTP library given: use -L/--library PATH or set $TPTP "
                            "(find one with 'thousandproblems discover', or get one with 'thousandproblems download')")
     try:
-        records = build_index(source, refresh=args.refresh,
-                              progress=_progress("indexing problem headers", not args.quiet))
+        result = search(args.library, query=query, refresh=args.refresh,
+                        progress=_progress("indexing problem headers", not args.quiet))
     except (FileNotFoundError, LibraryError) as e:
         raise CommandError(str(e)) from None
     if not args.quiet and sys.stderr.isatty():
         sys.stderr.write("\r" + " " * 60 + "\r")
-    hits = [r for r in records if query.matches(r)]
-    if args.limit is not None:
-        shown = hits[:args.limit]
-    else:
-        shown = hits
+    return result
 
-    if args.count:
-        print(len(hits))
-        return 0 if hits else 1
-    if args.format == "json":
-        print(json.dumps([r.as_dict() for r in shown], indent=2))
-    elif args.format == "paths":
-        library = open_library(source)
-        with library:
+
+def cmd_search(args) -> int:
+    result = _search(args, _query(args))
+    with result:
+        hits = result.records
+        shown = hits[:args.limit] if args.limit is not None else hits
+
+        if args.count:
+            print(len(hits))
+            return 0 if hits else 1
+        if args.format == "json":
+            print(json.dumps([r.as_dict() for r in shown], indent=2))
+        elif args.format == "paths":
             for r in shown:
-                print(_location(library, r.path))
-    elif args.format == "table":
-        print(f"{'Problem':<18} {'Form':<4} {'Status':<4} {'Rating':>6} {'Formulae':>8} {'Atoms':>8} "
-              f"{'Symbols':>7} {'Vars':>6}  SPC")
-        for r in shown:
-            symbols = r.stat("symbols")
-            if symbols is None and (r.stat("predicates") is not None or r.stat("functors") is not None):
-                symbols = (r.stat("predicates") or 0) + (r.stat("functors") or 0)
-            cell = lambda v, w: f"{'-' if v is None else v:>{w}}"      # noqa: E731
-            rating = "-" if r.rating is None else f"{r.rating:.2f}"
-            print(f"{r.name:<18} {r.form or '-':<4} {r.status_code or '-':<4} {rating:>6} "
-                  f"{cell(r.stat('formulae', 'clauses'), 8)} {cell(r.stat('atoms', 'literals'), 8)} "
-                  f"{cell(symbols, 7)} {cell(r.stat('variables'), 6)}  {r.spc or ''}")
+                print(_location(result.library, r.path))
+        elif args.format == "table":
+            print(f"{'Problem':<18} {'Form':<4} {'Status':<4} {'Rating':>6} {'Formulae':>8} {'Atoms':>8} "
+                  f"{'Symbols':>7} {'Vars':>6}  SPC")
+            for r in shown:
+                symbols = r.stat("symbols")
+                if symbols is None and (r.stat("predicates") is not None or r.stat("functors") is not None):
+                    symbols = (r.stat("predicates") or 0) + (r.stat("functors") or 0)
+                cell = lambda v, w: f"{'-' if v is None else v:>{w}}"      # noqa: E731
+                rating = "-" if r.rating is None else f"{r.rating:.2f}"
+                print(f"{r.name:<18} {r.form or '-':<4} {r.status_code or '-':<4} {rating:>6} "
+                      f"{cell(r.stat('formulae', 'clauses'), 8)} {cell(r.stat('atoms', 'literals'), 8)} "
+                      f"{cell(symbols, 7)} {cell(r.stat('variables'), 6)}  {r.spc or ''}")
+        else:
+            for r in shown:
+                print(r.name)
+        if not args.quiet:
+            more = f" (showing {len(shown)})" if len(shown) != len(hits) else ""
+            print(f"{len(hits)} of {result.searched} problems match{more}", file=sys.stderr)
+        return 0 if hits else 1
+
+
+# ---------------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------------
+
+
+def _install(prover, args, jobs: Optional[int] = None) -> str:
+    from .provers import ProverError
+
+    log = None if args.quiet else (lambda message: print(message, file=sys.stderr))
+    try:
+        return prover.install(force=getattr(args, "force", False), jobs=jobs, log=log)
+    except NotImplementedError as e:
+        raise CommandError(str(e)) from None
+    except ProverError as e:
+        raise CommandError(str(e)) from None
+
+
+def cmd_install(args) -> int:
+    from .install import Platform
+    from .provers import PRESETS, ProverError
+
+    try:
+        platform = Platform.parse(args.platform) if args.platform else Platform.detect()
+    except ValueError as e:
+        raise CommandError(str(e)) from None
+    if args.list or not args.prover:
+        if not args.list:
+            print("name a prover to install, e.g. 'thousandproblems install vampire'; the ones known:\n",
+                  file=sys.stderr)
+        print(f"platform: {platform}")
+        for name, cls in PRESETS.items():
+            prover = cls(platform=platform)
+            how = ("builds from source" if cls.build_commands else "downloads a release") if cls.download_url \
+                else "no installer"
+            installed = ", ".join(prover.installed_versions()) or "-"
+            found = shutil.which(cls.binary)
+            print(f"  {name:<9} default {cls.default_version or '-':<8} {how:<21} installed: {installed}"
+                  + (f"   on $PATH: {found}" if found else ""))
+        return 0 if args.list else 1
+    cls = PRESETS.get(args.prover)
+    if cls is None:
+        raise CommandError(f"don't know how to install {args.prover!r}; known: {', '.join(PRESETS)}")
+    try:
+        prover = cls(version=args.version, platform=platform)
+    except ProverError as e:
+        raise CommandError(str(e)) from None
+    print(_install(prover, args, args.jobs))
+    return 0
+
+
+def _safe_filename(text: str) -> str:
+    return "".join(c if c.isalnum() or c in "._+-^=#" else "_" for c in text)
+
+
+def _save_outputs(report, folder: str) -> None:
+    for r in report.results:
+        target = Path(folder) / _safe_filename(r.prover)
+        target.mkdir(parents=True, exist_ok=True)
+        stem = _safe_filename(r.problem)
+        (target / f"{stem}.out").write_text(r.stdout, encoding="utf-8")
+        if r.stderr.strip():
+            (target / f"{stem}.err").write_text(r.stderr, encoding="utf-8")
+
+
+def cmd_run(args) -> int:
+    from .provers import ProverCollection, ProverError
+    from .runner import run
+    from .search import CRITERIA
+
+    if not args.prover:
+        raise CommandError("give at least one prover with -p/--prover, e.g. -p eprover -p 'vampire --mode casc'")
+    query = _query(args)
+    if query and args.names:
+        raise CommandError("give problem names or search criteria, not both "
+                           "(a name pattern is a criterion too: --name 'SET00*')")
+    if not query and not args.names:
+        raise CommandError("no problems: give problem names or files, or search criteria (see --help)")
+    try:
+        provers = ProverCollection.from_specs(args.prover, input=args.input, platform=args.platform)
+    except (ProverError, ValueError) as e:
+        raise CommandError(str(e)) from None
+    if args.install:
+        for prover in provers.missing():
+            _install(prover, args)
+    missing = provers.missing()
+    if missing:
+        raise CommandError("prover not found: " + ", ".join(f"{p.name} (binary {p.binary!r})" for p in missing)
+                           + "\n(install a known one with 'thousandproblems install NAME [--version X]', "
+                             "or add --install)")
+
+    searched = None
+    if query:
+        searched = _search(args, query)
+        problems = searched[:args.limit] if args.limit is not None else searched
+        library = None
     else:
-        for r in shown:
-            print(r.name)
-    if not args.quiet:
-        more = f" (showing {len(shown)})" if len(shown) != len(hits) else ""
-        print(f"{len(hits)} of {len(records)} problems match{more}", file=sys.stderr)
-    return 0 if hits else 1
+        library = _open(args.library, local=False)
+        names = []
+        for name in args.names:
+            names.extend([name] if Path(name).is_file() else _expand_names(library, [name]))
+        problems = names[:args.limit] if args.limit is not None else names
+    if not len(problems):
+        raise CommandError("no problems match")
+
+    def report_one(r, done, total) -> None:
+        if args.quiet:
+            return
+        flag = "  ! contradicts the header" if r.correct is False else ""
+        detail = f"  {r.error}" if r.error else ""
+        print(f"[{done}/{total}] {r.problem}  {r.prover}  {r.status} {r.runtime:.2f}s{flag}{detail}", file=sys.stderr)
+
+    try:
+        report = run(problems, provers, timeout=args.timeout, jobs=args.jobs, library=library,
+                     keep_output=bool(args.output_dir), on_result=report_one)
+    finally:
+        if searched is not None:
+            searched.close()
+        if library is not None:
+            library.close()
+    if args.output_dir:
+        _save_outputs(report, args.output_dir)
+    if args.format == "json":
+        print(report.to_json(output=bool(args.output_dir)))
+    elif args.format == "csv":
+        sys.stdout.write(report.to_csv())
+    else:
+        print(report.table())
+    return 0
 
 
 # ---------------------------------------------------------------------------------
@@ -700,6 +840,7 @@ def _same_path(a, b) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .runner import DEFAULT_TIMEOUT
     from .search import CRITERIA
 
     library_opt = argparse.ArgumentParser(add_help=False)
@@ -817,6 +958,77 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("--refresh", action="store_true", help="rebuild the header index")
     out.add_argument("-q", "--quiet", action="store_true", help="no progress or totals on stderr")
     p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser(
+        "run", parents=[library_opt], help="run problems against theorem provers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Run problems against one or more theorem provers and report, for each, the SZS\n"
+                    "status (proved, satisfiable, timeout ...) and the run time. Choose the problems by\n"
+                    "name (or a file), or by the same criteria as 'search'. A prover is a command line:\n"
+                    "its first word is the binary (on $PATH, or a path), the rest are options passed as\n"
+                    "they are. 'eprover' and 'vampire' have presets that also set their time limit.\n"
+                    "Prefix a command with LABEL= to name it.",
+        epilog="examples:\n"
+               "  thousandproblems run SET001-1 'SEU14*' -p eprover -p vampire -t 10\n"
+               "  thousandproblems run --domain SET --status THM --rating 0 --limit 50 -p eprover -j 4\n"
+               "  thousandproblems run my_problem.p -p 'casc=vampire --mode casc' -p './myprover --fast'\n"
+               "  thousandproblems search --form FOF --rating 0 -q | thousandproblems run - -p eprover --format csv")
+    p.add_argument("names", nargs="*", metavar="NAME",
+                   help="problem names such as SET001-1 (wildcards need a local library), problem files, or "
+                        "'-' to read names from stdin; or use the criteria below instead")
+    run_opts = p.add_argument_group("provers and limits")
+    run_opts.add_argument("-p", "--prover", action="append", metavar="COMMAND",
+                          help="a prover to run, e.g. eprover, 'vampire --mode casc', "
+                               "'label=./bin/prover -x', or eprover@3.5.10 for an installed version; "
+                               "repeat for several")
+    run_opts.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT, metavar="SECONDS",
+                          help=f"time each prover gets per problem (default: {DEFAULT_TIMEOUT:g})")
+    run_opts.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                          help="runs at once (default: 1; timings are fairest with 1)")
+    run_opts.add_argument("--install", action="store_true",
+                          help="first install any prover that is not found (see 'install')")
+    run_opts.add_argument("--platform", metavar="OS-ARCH",
+                          help="the platform installed provers are for, e.g. linux-arm64 (default: this machine's)")
+    run_opts.add_argument("--input", choices=("file", "stdin"),
+                          help="how the problem reaches a prover: a temporary file, or its standard input "
+                               "(default: a file)")
+    criteria = p.add_argument_group("choose problems by their properties (as in 'search')")
+    for name, (_, text) in CRITERIA.items():
+        criteria.add_argument(f"--{name.replace('_', '-')}", dest=name, action="append", metavar="VALUE", help=text)
+    out = p.add_argument_group("output")
+    out.add_argument("--limit", type=int, metavar="N", help="run at most N problems")
+    out.add_argument("--format", choices=("table", "json", "csv"), default="table",
+                     help="a table of results (default), or JSON or CSV")
+    out.add_argument("--output-dir", metavar="DIR",
+                     help="save each prover's output to DIR/PROVER/PROBLEM.out (and .err)")
+    out.add_argument("--refresh", action="store_true", help="rebuild the header index")
+    out.add_argument("-q", "--quiet", action="store_true", help="no progress lines on stderr")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser(
+        "install", help="download or build a theorem prover",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Install a prover into the cache directory, where 'run' finds it. Each version and\n"
+                    "platform gets a folder of its own. Vampire is downloaded as a release build; E\n"
+                    "publishes none, so it is built from its source on GitHub (needs make and a C\n"
+                    "compiler).",
+        epilog="examples:\n"
+               "  thousandproblems install --list\n"
+               "  thousandproblems install vampire\n"
+               "  thousandproblems install eprover --version 3.5.10\n"
+               "  thousandproblems install vampire --version latest --platform linux-arm64\n"
+               "  thousandproblems run SET001-1 -p eprover@3.5.10 -p vampire@5.1.0")
+    p.add_argument("prover", nargs="?", help="a known prover: see --list")
+    p.add_argument("--version", metavar="X.Y.Z",
+                   help="the version (default: the one this release knows; 'latest' asks GitHub)")
+    p.add_argument("--platform", metavar="OS-ARCH",
+                   help="linux, macos or windows with x86_64 or arm64, e.g. macos-arm64 "
+                        "(default: this machine's; a prover built from source can only be installed for it)")
+    p.add_argument("--force", action="store_true", help="install again even if that version is there")
+    p.add_argument("-j", "--jobs", type=int, metavar="N", help="parallel build jobs (default: all CPUs)")
+    p.add_argument("--list", action="store_true", help="list the known provers and what is installed")
+    p.add_argument("-q", "--quiet", action="store_true", help="only print the path of the binary")
+    p.set_defaults(func=cmd_install)
     return parser
 
 

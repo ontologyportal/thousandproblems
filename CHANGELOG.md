@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Running theorem provers: `thousandproblems run` runs problems (by name, file, or the same
+  criteria as `search`) against several provers and reports each SZS status and run time as a
+  table, JSON or CSV.
+  - `thousandproblems.provers`: `SubprocessProver` (a binary by name or path, options from a dict,
+    the problem through a temporary file or stdin, an overridable `install()` that can follow a
+    `download_url`), `BuiltInProver` and `CallableProver` (in-process, given the parsed problem and a
+    configuration), `ProverCollection`, `RunResult`, and `EProver` and `Vampire` presets.
+  - `thousandproblems.runner`: `run` and `iter_results`, with parallel jobs and a `RunReport`.
+  - `thousandproblems.problem.Problem`: a problem with the files it includes.
+  - Installing provers: `thousandproblems install` and `SubprocessProver.install()` fetch a given
+    *version* for a given *platform* (detected, or `--platform macos-arm64`) into
+    `provers/NAME/VERSION-PLATFORM/`. A URL template (`{version}`, `{tag}`, `{os}`, `{arch}` ...) maps the two to
+    a download; `version="latest"` asks GitHub; downloads are checked against known SHA-256 sums; and a
+    prover distributed as source is built (`build_commands`). Vampire installs from its GitHub release
+    and E is built from its GitHub source. `-p eprover@3.5.10` runs an installed version and
+    `run --install` installs what is missing. `thousandproblems.install` has `Platform` and the helpers.
+  - `thousandproblems.szs`: `Status` and a reader for the SZS status line and output block.
+- **Breaking:** `search()` returns a `SearchResult` (names, the criteria used, the source, and an
+  iterator that fetches each `Problem` as you reach it) instead of a list of records. The records
+  are `result.records`; `result.names` lists the names.
 - Python 3.15: binary wheels with the C parser, and 3.15 in the test matrix.
 - A `thousandproblems` command (also `python -m thousandproblems`) with the subcommands
   `fetch` (problems with their axioms), `download` (the whole library), `validate` (check a

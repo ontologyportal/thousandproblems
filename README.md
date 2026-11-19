@@ -12,6 +12,8 @@ Provers") problem and solution syntax.
   it isn't available the same parser runs in pure Python, with identical results.
 - Fetches problems, with their axiom includes, from the TPTP website, a tarball or an
   unpacked library.
+- Searches a local library by problem properties, and runs the problems it finds against
+  theorem provers (subprocess or in-process), reading their SZS status and run time.
 - No dependencies. Python 3.11+.
 
 ```
@@ -253,17 +255,223 @@ and cached in `$THOUSANDPROBLEMS_CACHE` until the library changes. TPTP2T's *sol
 properties (which systems solved a problem, and how) come from the TSTP solution library, not
 the problem library, so `search` does not offer them.
 
-The same is available from Python:
+The same is available from Python. A search returns a `SearchResult`:
 
 ```python
 from thousandproblems.search import search
-for record in search("/data/TPTP-v10.0.0", form="FOF", status="THM", rating="unsolved"):
-    print(record.name, record.rating, record.stat("formulae"))
+
+hits = search("/data/TPTP-v10.0.0", form="FOF", status="THM", rating="unsolved")
+hits.names            # ['ALG212+1', ...]: the problems found, sorted
+hits.params           # {'form': ['FOF'], 'status': ['THM'], 'rating': ['unsolved']}
+hits.source           # '/data/TPTP-v10.0.0'
+hits.records          # what the index knows: .rating, .status, .stat("formulae") ...
+len(hits), hits.searched
+
+for problem in hits:  # a Problem, fetched when the loop reaches it
+    print(problem.name, problem.record.rating, len(problem.parsed().formulae))
+
+hits[0]               # one Problem; hits[:10] is a smaller SearchResult
 ```
+
+Nothing is fetched until you iterate, so a result with thousands of problems costs a list of
+names. Use `with search(...) as hits:` (or `hits.close()`) to release a tarball it opened.
 
 `thousandproblems.stats` (`compute_stats`, `syntax_stats`, `SPC`),
 `thousandproblems.validate.validate_library` and `thousandproblems.download.download_library`
 are the other building blocks the commands use.
+
+## Running theorem provers
+
+`thousandproblems run` runs problems against one or more provers and reports, for each pair,
+the SZS status the prover gave and how long it took. Problems are chosen by name (or file), or
+by the same criteria as `search`. A prover is a command line: the first word is the binary (on
+`$PATH`, or a path), the rest are its options.
+
+```sh
+thousandproblems run SET001-1 'SEU14*' -p eprover -p vampire -t 10
+thousandproblems run --domain SET --status THM --rating 0 --limit 50 -p eprover -p vampire -j 4
+thousandproblems run my_problem.p -p 'casc=vampire --mode casc' -p 'mine=./bin/prover --fast'
+thousandproblems search --form FOF --rating 0 -q | thousandproblems run - -p eprover --format csv
+```
+
+```
+Problem   eprover          vampire
+--------  ---------------  ---------------
+SET001-1  proved 0.00s     proved 0.01s
+SET002-1  timeout          satisfiable 0.01s
+
+Prover   solved  proved  satisfiable  timeout  unknown  error  time(s)
+eprover     1/2       1            0        1        0      0     0.00
+vampire     2/2       1            1        0        0      0     0.02
+```
+
+Each result has a status: `proved` (Theorem, Unsatisfiable, ContradictoryAxioms ...),
+`satisfiable` (Satisfiable, CounterSatisfiable ...), `unknown` (the prover gave up),
+`timeout`, `resource_out`, or `error` (a crash, a syntax error, a missing binary), taken from the
+`SZS status` line in the prover's TSTP output. A verdict that contradicts the `% Status` in the
+problem's header is marked `!`. The run time is wall-clock seconds around the prover process.
+
+| Option | |
+| --- | --- |
+| `-p`, `--prover COMMAND` | A prover; repeat for several. `LABEL=COMMAND` names it, so one binary can run with different options. `eprover` and `vampire` also set their own time limit from `-t`. |
+| `-t`, `--timeout SECONDS` | Per problem and prover (default 60). The prover is killed, with anything it started, when time is up. |
+| `-j`, `--jobs N` | Runs at once. Timings are fairest with 1. |
+| `--input file\|stdin` | How the problem reaches the prover: a temporary file whose path ends the command line (default), or its standard input. |
+| `--limit N` | At most N problems. |
+| `--format table\|json\|csv` | The report. Progress lines go to stderr unless `-q`. |
+| `--output-dir DIR` | Keep each prover's output as `DIR/PROVER/PROBLEM.out`. |
+
+Problems with `include` lines are written to the temporary folder in the TPTP layout, together
+with the files they include, and `$TPTP` points at it, so provers find their axioms.
+
+### Installing provers
+
+`thousandproblems install` fetches a prover into the cache directory, a version and a platform at
+a time, and `run` finds it there. Two are known:
+
+| Prover | How it is installed |
+| --- | --- |
+| `vampire` | The release build for your platform, downloaded from [GitHub](https://github.com/vprover/vampire/releases) and checked against a known SHA-256. |
+| `eprover` | E publishes no binaries, so the tagged source is downloaded from [GitHub](https://github.com/eprover/eprover) and built with `./configure && make` (needs `make` and a C compiler; about 15 seconds). |
+
+```sh
+thousandproblems install --list                        # what is known and installed, and your platform
+thousandproblems install vampire                       # the version this release knows (5.1.0)
+thousandproblems install eprover --version 3.5.10
+thousandproblems install vampire --version latest      # asks GitHub what the newest is
+thousandproblems install vampire --platform linux-arm64    # for another platform (a download only)
+
+# a prover@version is only ever an installed copy of that version, so two versions can be compared
+thousandproblems run --domain SET -p eprover@3.5.10 -p eprover -p vampire@5.1.0 --install
+```
+
+*Versions* are written `5.1.0`; a tag such as `v5.1.0` or `E-3.5.10` is understood too, and `latest`
+is looked up on GitHub (set `GITHUB_TOKEN` if you hit its rate limit). *Platforms* are an
+operating system, `linux`, `macos` or `windows`, and a CPU, `x86_64` or `arm64`, written
+`macos-arm64`; common spellings (`darwin`, `aarch64`, `amd64`, `x64`) work. Without `--platform`
+yours is detected. Each version and platform gets its own folder, `provers/NAME/VERSION-PLATFORM/`,
+so nothing is overwritten. `-p NAME@VERSION` runs only that installed version; a plain `-p NAME`
+uses what is on `$PATH`, and failing that the newest installed one. `run --install` installs
+whatever is missing first. A prover built from source can only be installed for the machine it is
+built on. On macOS the first run of a new binary is slower while the system checks it, so run
+timing comparisons twice.
+
+### From Python
+
+```python
+from thousandproblems.search import search
+from thousandproblems.provers import EProver, Vampire, SubprocessProver, ProverCollection
+from thousandproblems.runner import run
+
+provers = ProverCollection([
+    EProver(),                                    # `eprover` on $PATH, --auto, CPU limit from the timeout
+    Vampire(args={"--mode": "casc"}, name="vampire-casc"),
+    SubprocessProver("./bin/myprover", {"--strategy": "fast", "--verbose": None}, input="stdin"),
+])
+hits = search("/data/TPTP-v10.0.0", domain="SET", status="THM", rating="0")
+report = run(hits[:20], provers, timeout=10, jobs=4)    # or provers.run(hits[:20], timeout=10)
+
+print(report.table())
+for r in report.results:
+    r.problem, r.prover, r.status, r.szs, r.runtime, r.correct
+report.summary()          # per prover: counts by status, solved, time
+report.to_csv(); report.to_json()
+```
+
+`run` takes a `SearchResult`, a `Problem`, a problem name (`library=` says where from), a path to
+a problem file, or a list of these, and fetches problems one at a time. A problem that cannot be
+fetched, or a prover that fails, gives an `error` result and the run goes on. `iter_results(...)`
+is the same as a generator.
+
+A single problem works the same way:
+
+```python
+from thousandproblems.problem import Problem
+
+problem = Problem.from_library("SET001-1", "/data/TPTP-v10.0.0")   # or Problem.from_file(...), from_text(...)
+result = EProver().run(problem, timeout=10)
+```
+
+**Subprocess provers.** `SubprocessProver(binary, args, ...)` takes the binary by name or path
+(absolute, or relative to the current folder). `args` is a dict written as command-line options:
+`{"--auto": None}` is `--auto`, `{"-t": 10}` is `-t 10`, `{"--cpu-limit=": 10}` is
+`--cpu-limit=10`, `{"-I": ["a", "b"]}` repeats the flag, and `False` leaves one out. `extra_args`,
+`env`, `cwd` and `input="file"|"stdin"` are also available.
+
+To describe a prover once, subclass it. `parse_output` is the hook for a prover whose output isn't
+plain TSTP, and a few attributes say how to install it. Here are the two that ship (abridged):
+
+```python
+class Vampire(SubprocessProver):                  # a release build per platform
+    binary = "vampire"
+    time_limit_arg = "-t"
+    github_repo = "vprover/vampire"
+    release_tag = "v{version}"                    # the tag of a version
+    default_version = "5.1.0"
+    download_url = "https://github.com/{repo}/releases/download/{tag}/vampire-{os}-{arch}.zip"
+    os_names = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}     # our names -> theirs
+    arch_names = {"x86_64": "X64", "arm64": "ARM64"}
+    checksums = {"5.1.0/macos-arm64": "02d88d06...", ...}                      # "VERSION/PLATFORM": sha256
+
+
+class EProver(SubprocessProver):                  # source only: build it
+    binary = "eprover"
+    default_args = {"--auto": None}
+    time_limit_arg = "--cpu-limit="
+    github_repo = "eprover/eprover"
+    release_tag = "E-{version}"
+    default_version = "3.5.10"
+    download_url = "https://github.com/{repo}/archive/refs/tags/{tag}.tar.gz"
+    build_tools = ("make", ("cc", "gcc", "clang"))      # a tuple means any one of them
+    build_commands = (("./configure",), ("make", "-j{jobs}"))
+    binary_path = "PROVER/eprover"                      # what the build makes, in the source tree
+```
+
+```python
+EProver().install()                                          # build the default version here
+Vampire(version="5.0.1", platform="linux-arm64").install()   # another version, for another platform
+Vampire(version="latest").install(log=print)                 # look up the newest, say what happens
+EProver(version="3.5.10").run(problem, timeout=10)           # that installed version, and no other
+```
+
+`install()` works out the version (the one asked for, else `default_version`, and `"latest"` is
+looked up through `github_repo`, or your own `latest_version()`), the platform (the one given,
+else detected), and from them the URL: `download_url` can be a string with `{version}`, `{tag}`,
+`{repo}`, `{os}`, `{arch}` and `{platform}` in it, or a dict of such strings keyed by platform
+(`"linux-x86_64"`) or system (`"linux"`). When `os_names` or `arch_names` are given, a platform
+they don't list is reported as unsupported. The download is checked against `checksums` (or
+`install(sha256=...)`), unpacked (zip and tar are recognised; anything else is taken to be the
+binary), built if there are `build_commands`, and moved into place only if everything worked, with
+only the binary kept (`keep_build_tree = True` keeps the source). A prover that needs something
+more involved overrides `install()`; with neither it raises `NotImplementedError`.
+`Platform.detect()` and `Platform.parse("macos-arm64")` (in `thousandproblems.install`) are the
+platform type, and `prover.installed_versions()` lists what is there.
+
+**Built-in provers.** `BuiltInProver` runs a prover inside the Python process: one written in
+Python, or a binding to a compiled one. It is given the parsed problem (includes expanded unless
+you set `expand_includes = False`) and the prover's configuration:
+
+```python
+from thousandproblems.provers import BuiltInProver, CallableProver, Solution
+
+class Saturate(BuiltInProver):
+    default_config = {"max_clauses": 10_000}
+
+    def solve(self, problem, context):            # problem is a thousandproblems.TPTPFile
+        for formula in problem.formulae:
+            context.check()                       # raises when the time is up
+            ...
+        return Solution("Theorem", solution="...proof...")    # or "GaveUp", or Status.UNKNOWN
+
+prover = Saturate(max_clauses=500)                 # config=... or keyword arguments
+CallableProver(lambda problem, context: "GaveUp", name="giveup")    # a function will do
+```
+
+`solve` returns a `Status`, an SZS name such as `"Theorem"`, or a `Solution`. A Python thread cannot
+be killed, so the timeout is enforced by waiting for `solve` in a worker thread: when time is up the
+result is `timeout` and `context.cancelled` is set, but code that ignores `context.expired()` keeps
+running in the background. Use a `SubprocessProver` where a hard limit matters. Run time for a
+built-in prover is the time in `solve`, not the time spent parsing the problem for it.
 
 ## Which parser is running?
 
