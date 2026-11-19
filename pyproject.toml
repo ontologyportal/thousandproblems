@@ -8,7 +8,7 @@ version = "0.4.0"
 description = "Framework for downloading, searching, and running prover tests over the TPTP problem set."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "GPL-3.0-or-later"
 authors = [{ name = "Ontology Portal", email = "pypi@ontologyportal.org" }]
 keywords = ["tptp", "parser", "theorem proving", "automated reasoning", "logic", "first-order logic"]
 classifiers = [
