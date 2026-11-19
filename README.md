@@ -1,20 +1,28 @@
 # thousandproblems
 
-A fast parser and printer for the [TPTP](https://tptp.org) ("Thousands of Problems for Theorem
-Provers") problem and solution syntax.
+A tool for downloading, searching, parsing, and testing provers against the 
+[TPTP](https://tptp.org) ("Thousands of Problems for Theorem Provers") problem and 
+solution library.
 
 - Every TPTP language: `thf`, `tff`, `tcf`, `fof`, `cnf` and `tpi`, including TF1/TH1
   polymorphism, the TXF/non-classical extensions, `include` directives, and annotations
   (sources, inference records, useful info).
-- One AST for all of them, with exact line and column in every error.
-- `str(node)` prints any node back as valid TPTP.
-- **A C extension does the parsing**, roughly 10 times faster than the pure-Python parser. If
-  it isn't available the same parser runs in pure Python, with identical results.
+- **A fast C extension to parse TPTP**, roughly 10 times faster than the pure-Python parser. If
+  it isn't available the same parser runs in pure Python, with identical results. Can be used
+  to support implementing a prover using Python
 - Fetches problems, with their axiom includes, from the TPTP website, a tarball or an
   unpacked library.
 - Searches a local library by problem properties, and runs the problems it finds against
   theorem provers (subprocess or in-process), reading their SZS status and run time.
+- Download, run and test variosu theorem provers
+  * The library comes with built in support for running [eprover](https://eprover.org) and 
+    [vampire](https://vprover.github.io)
+  * Specify your own theorem prover both via the programmatic interface or as a binary
+    to be run in a subprocess.
+- Also provides a CLI interface (use with `python -m thousandproblems` or pipx)
 - No dependencies. Python 3.11+.
+
+## Installation
 
 ```
 pip install thousandproblems
@@ -36,7 +44,7 @@ Import it as `thousandproblems`; the examples below alias it to `tptp`.
 fof(ax1,axiom,! [X] : (p(X) => q(X))).
 ```
 
-## Variable indexes and the symbol table
+### Variable indexes
 
 Each `Variable` has an `index`: the distinct variables of one formula are numbered 1, 2, 3 ... in
 order of first appearance.
@@ -52,6 +60,8 @@ own variable, so `! [Y,X] : p(X,Y)` numbers Y 1 and X 2, and `(! [X] : p(X)) & (
 gives its two `X` the indexes 1 and 2. Numbering restarts for each formula, and a variable that
 is not part of a formula (in an annotation, or built by hand) has index 0. `index` is not
 compared, so `Variable("X") == Variable("X", 1)`.
+
+### Per-Problem Symbol Table
 
 `problem.symbols` is the symbol table: a tuple of `Symbol(name, arity)`, one for each distinct
 function, constant or predicate the formulae use, in order of first appearance. `f/1` and `f/2`
@@ -70,7 +80,7 @@ type declarations and annotations are not symbols. In THF, `f @ a` uses the symb
 `a/0`. Each formula has its own `symbols`, and the file's table is rebuilt when
 `expand_includes` brings other files in, so it only covers formulae that are really there.
 
-## Functions
+### Parsing Functions
 
 | Function | |
 | --- | --- |
@@ -95,7 +105,43 @@ docstring (`help(thousandproblems)`) for the full description of the tree.
 This is a *syntax* parser: it does not check sorts, arities, roles, or whether variables are
 bound.
 
+### Parser backends
+
+This library provides two backend options for parsing TPTP, a native Python version (no 
+dependencies and no FFI) and a C-compiled version using python `Ctypes`. You can check
+which backend you are using like this:
+
+```python
+>>> tptp.BACKEND
+'c'
+```
+
+The C backend is used when it is installed, and `BACKEND` is set to `"c"`. Otherwise (no wheel for
+your platform and no compiler when installing from source, or you asked for it) the pure-Python
+parser runs and `BACKEND` is `"python"`. Set `THOUSANDPROBLEMS_PURE_PYTHON=1` before importing to
+force pure Python.
+
+**DEVELOPER NOTE**: CPython's garbage collector frees a very deeply nested tree recursively. Each free
+uses a few hundred bytes of stack per level, therefore freeing a tree around a thousand levels deep 
+on a thread with a tiny stack (256 KB) crashed Python 3.14, with either parser. If you handle
+inputs like that, don't do it on threads with stacks that small. The default Python interpretter thread 
+stack size on every mainstream OS and platform is fine.
+
+Measured on an Apple M-series laptop, Python 3.14, on generated problems of 0.4 to 0.7 MB:
+
+| | pure Python | C | speedup |
+| --- | --- | --- | --- |
+| cnf | 0.274 s | 0.026 s | 10.5x |
+| fof | 0.269 s | 0.027 s | 10.0x |
+| tff | 0.221 s | 0.020 s | 10.9x |
+| thf | 0.160 s | 0.013 s | 12.4x |
+
+Run `python benchmarks/bench.py` to measure on your machine.
+
 ## Fetching problems from a TPTP library
+
+Using `thousandproblems` you can fetch TPTP problems either from a local copy of the TPTP 
+problem library or from the officially hosted [tptp.org](https://tptp.org)
 
 ```python
 # the TPTP website (current release)
@@ -125,7 +171,8 @@ together with the axiom files it includes in one request, and caches everything 
 `$THOUSANDPROBLEMS_CACHE` (default: your platform's cache directory), so repeat reads cost nothing.
 If the server says you are going too fast you get `RateLimited`, with the time to wait; nothing
 is retried for you. Only the current release is available online; for another version, open its
-tarball. For anything more than a handful of problems, download the library.
+tarball. For anything more than a handful of problems, download the entire library to your local
+machine.
 
 Reading a compressed tarball means decompressing up to each file, so unpack it
 (and use the folder) if you will read many problems.
@@ -136,6 +183,8 @@ Installing the package adds a `thousandproblems` command (`python -m thousandpro
 too). Commands that need a library take `-L/--library` with a folder, a tarball or a server
 URL. Without it they use the folder named by `$TPTP`, and `fetch` and `stats` fall back to the
 TPTP website.
+
+Some example commands (also available if you run the `--help` option):
 
 ```sh
 # the whole library (about 1 GB): the latest release, or --version 9.0.0; --list shows them all
@@ -160,26 +209,8 @@ thousandproblems stats SET001-1
 thousandproblems stats my_problem.p --symbols --json
 ```
 
-`validate` checks the standard layout: the `Problems/` and `Axioms/` folders, three-letter
-domain folders, and problem files named after their domain. `--includes` checks that every
-include can be found, and `--parse` also parses every file (slow). A missing `Documents/`,
-`Generators/`, `Scripts/` or `TPTP2X/` folder is only a warning, since a trimmed copy still
-works; `--strict` makes warnings fail too.
-
-`discover` looks for libraries: folders holding `Problems/` and `Axioms/`, searched four levels
-deep (`--depth`) under the folders you name, or by default under the current folder, your home
-folder, `/opt`, `/usr/local/share`, `/usr/share`, `/srv` and `/data`. It checks each one,
-lists them (usable ones first, then newest), and prints the command that sets `$TPTP` for your
-shell (`--shell bash|zsh|fish|sh|powershell|cmd` to choose another). With `--set`, or when you
-say yes at the prompt, it adds that command to your shell's startup file (`~/.zshrc`,
-`~/.bashrc`, or `~/.bash_profile` on macOS, a `conf.d` file for fish, `~/.profile` otherwise)
-between marker comments, so running it again replaces that line rather than adding another.
-On Windows it runs `setx` instead. Without a terminal, `--set` also needs `--yes`. A program
-can't change the environment of the shell that started it, so the current terminal still needs
-the printed command, or a new window.
-
-`stats` shows the figures it works out from the formulae (with the included axioms, unless you
-pass `--no-expand`) next to the `% Syntax` statistics that the TPTP header declares:
+`stats` shows info about a given problem (with the included axioms, unless you
+pass `--no-expand`):
 
 ```
 Problem        : SET001-1  (Problems/SET/SET001-1.p)
@@ -324,7 +355,7 @@ problem's header is marked `!`. The run time is wall-clock seconds around the pr
 Problems with `include` lines are written to the temporary folder in the TPTP layout, together
 with the files they include, and `$TPTP` points at it, so provers find their axioms.
 
-### Installing provers
+### Installing provers using the CLI
 
 `thousandproblems install` fetches a prover into the cache directory, a version and a platform at
 a time, and `run` finds it there. Two are known:
@@ -345,18 +376,20 @@ thousandproblems install vampire --platform linux-arm64    # for another platfor
 thousandproblems run --domain SET -p eprover@3.5.10 -p eprover -p vampire@5.1.0 --install
 ```
 
-*Versions* are written `5.1.0`; a tag such as `v5.1.0` or `E-3.5.10` is understood too, and `latest`
-is looked up on GitHub (set `GITHUB_TOKEN` if you hit its rate limit). *Platforms* are an
-operating system, `linux`, `macos` or `windows`, and a CPU, `x86_64` or `arm64`, written
-`macos-arm64`; common spellings (`darwin`, `aarch64`, `amd64`, `x64`) work. Without `--platform`
-yours is detected. Each version and platform gets its own folder, `provers/NAME/VERSION-PLATFORM/`,
-so nothing is overwritten. `-p NAME@VERSION` runs only that installed version; a plain `-p NAME`
-uses what is on `$PATH`, and failing that the newest installed one. `run --install` installs
-whatever is missing first. A prover built from source can only be installed for the machine it is
-built on. On macOS the first run of a new binary is slower while the system checks it, so run
-timing comparisons twice.
+Some additional usage notes:
 
-### From Python
+- *Versions* are written `5.1.0` (a tag such as `v5.1.0` or `E-3.5.10` is understood too), and `latest`
+  is looked up on GitHub (set the `GITHUB_TOKEN` with an access token if you hit Github's rate limit). 
+- *Platforms* are an operating system, `linux`, `macos` or `windows`, and a CPU, `x86_64` or `arm64`, written
+  `macos-arm64`. Common alternative spellings (e.g. `darwin`, `aarch64`, `amd64`, `x64`) also work. Without 
+  `--platform` yours is detected automatically. 
+- Each version and platform gets its own folder, `provers/NAME/VERSION-PLATFORM/`,
+  so nothing is overwritten. You can reference a specific version using `-p NAME@VERSION`, while a plain 
+  `-p NAME` uses what is on `$PATH`, and failing that, runs the newest installed one. 
+- `run --install` installs whatever is missing first. A prover built from source can only be installed 
+  for the machine it is built on.
+
+### Running Provers Programmtically from Python
 
 ```python
 from thousandproblems.search import search
@@ -399,7 +432,7 @@ result = EProver().run(problem, timeout=10)
 `env`, `cwd` and `input="file"|"stdin"` are also available.
 
 To describe a prover once, subclass it. `parse_output` is the hook for a prover whose output isn't
-plain TSTP, and a few attributes say how to install it. Here are the two that ship (abridged):
+plain TSTP, and a few attributes say how to install it. Here are the two that come with the package:
 
 ```python
 class Vampire(SubprocessProver):                  # a release build per platform
@@ -435,20 +468,23 @@ EProver(version="3.5.10").run(problem, timeout=10)           # that installed ve
 ```
 
 `install()` works out the version (the one asked for, else `default_version`, and `"latest"` is
-looked up through `github_repo`, or your own `latest_version()`), the platform (the one given,
-else detected), and from them the URL: `download_url` can be a string with `{version}`, `{tag}`,
+looked up through `github_repo`, or your own `latest_version()`) and the platform (the one given,
+else detected)> It then constructs the correct`download_url` which can be a string `{version}`, `{tag}`,
 `{repo}`, `{os}`, `{arch}` and `{platform}` in it, or a dict of such strings keyed by platform
 (`"linux-x86_64"`) or system (`"linux"`). When `os_names` or `arch_names` are given, a platform
 they don't list is reported as unsupported. The download is checked against `checksums` (or
 `install(sha256=...)`), unpacked (zip and tar are recognised; anything else is taken to be the
 binary), built if there are `build_commands`, and moved into place only if everything worked, with
-only the binary kept (`keep_build_tree = True` keeps the source). A prover that needs something
-more involved overrides `install()`; with neither it raises `NotImplementedError`.
+only the binary kept (`keep_build_tree = True` keeps the source). 
+
+You are free to reimplement `install()` if you need a more complex installation behavior for your
+prover. 
+
 `Platform.detect()` and `Platform.parse("macos-arm64")` (in `thousandproblems.install`) are the
 platform type, and `prover.installed_versions()` lists what is there.
 
-**Built-in provers.** `BuiltInProver` runs a prover inside the Python process: one written in
-Python, or a binding to a compiled one. It is given the parsed problem (includes expanded unless
+**Built-in provers.** `BuiltInProver` runs a prover inside the Python process (e.g. one written in
+Python, or a binding to a compiled one). It is given the parsed problem (includes expanded unless
 you set `expand_includes = False`) and the prover's configuration:
 
 ```python
@@ -472,40 +508,6 @@ be killed, so the timeout is enforced by waiting for `solve` in a worker thread:
 result is `timeout` and `context.cancelled` is set, but code that ignores `context.expired()` keeps
 running in the background. Use a `SubprocessProver` where a hard limit matters. Run time for a
 built-in prover is the time in `solve`, not the time spent parsing the problem for it.
-
-## Which parser is running?
-
-```python
->>> tptp.BACKEND
-'c'
-```
-
-The C extension is used when it is installed, and `BACKEND` is `"c"`. Otherwise (no wheel for
-your platform and no compiler when installing from source, or you asked for it) the pure-Python
-parser runs and `BACKEND` is `"python"`. Set `THOUSANDPROBLEMS_PURE_PYTHON=1` before importing to
-force pure Python.
-
-The C parser hands very deeply nested input (more than about a thousand levels of nested terms
-or a few hundred of bare parentheses) to the Python parser, so that it can never overflow the
-C stack, even on a thread with a small one. You get the same result either way, just more
-slowly.
-
-One thing the parser cannot control: CPython frees a very deeply nested tree recursively, using
-a few hundred bytes of stack per level. Freeing a tree around a thousand levels deep on a thread
-with a tiny stack (256 KB) crashed Python 3.14 on musl Linux, with either parser. If you handle
-inputs like that, don't do it on threads with stacks that small; the default thread stack size on
-every mainstream platform is fine.
-
-Measured on an Apple M-series laptop, Python 3.14, on generated problems of 0.4 to 0.7 MB:
-
-| | pure Python | C | speedup |
-| --- | --- | --- | --- |
-| cnf | 0.274 s | 0.026 s | 10.5x |
-| fof | 0.269 s | 0.027 s | 10.0x |
-| tff | 0.221 s | 0.020 s | 10.9x |
-| thf | 0.160 s | 0.013 s | 12.4x |
-
-Run `python benchmarks/bench.py` to measure on your machine.
 
 ## Development
 

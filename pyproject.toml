@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "thousandproblems"
-version = "0.3.0"
-description = "Fast parser and printer for the TPTP problem and solution syntax (thf, tff, tcf, fof, cnf, tpi)."
+version = "0.4.0"
+description = "Framework for downloading, searching, and running prover tests over the TPTP problem set."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
