@@ -353,6 +353,16 @@ class SubprocessRuns(WithFake):
 
 
 class Specs(unittest.TestCase):
+    def test_windows_quoting(self):
+        # On Windows shlex runs with posix=False, which keeps quotes; they must not reach the prover.
+        with mock.patch.object(sys, "platform", "win32"):
+            p = prover_from_spec(r"""C:\tools\prover.exe -a 'b c' "d e" --opt="f g" --plain""")
+        self.assertEqual(p.binary, r"C:\tools\prover.exe")
+        self.assertEqual(p.extra_args, ["-a", "b c", "d e", "--opt=f g", "--plain"])
+        with mock.patch.object(sys, "platform", "win32"):
+            self.assertEqual(prover_from_spec('"C:\\Program Files\\p\\prover.exe" -x').binary,
+                             r"C:\Program Files\p\prover.exe")
+
     def test_specs(self):
         p = prover_from_spec("eprover --auto-schedule --cpu-limit=10")
         self.assertIsInstance(p, provers.EProver)

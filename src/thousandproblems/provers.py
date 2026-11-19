@@ -633,6 +633,32 @@ class Vampire(SubprocessProver):
 PRESETS: dict[str, type[SubprocessProver]] = {"eprover": EProver, "vampire": Vampire}
 
 
+_CHUNK = re.compile(r"""\"([^\"]*)\"|'([^']*)'|([^\s"']+)""")
+
+
+def _split_windows(spec: str) -> list[str]:
+    """Words of a command line the way a Windows shell reads it: backslashes are kept, and ``'..'``
+    and ``".."`` group text, also inside a word (``--opt="a b"``), and are removed."""
+    words: list[str] = []
+    current: Optional[str] = None
+    pos = 0
+    while pos < len(spec):
+        if spec[pos].isspace():
+            if current is not None:
+                words.append(current)
+                current = None
+            pos += 1
+            continue
+        chunk = _CHUNK.match(spec, pos)
+        if chunk is None:
+            raise ValueError("No closing quotation")
+        current = (current or "") + next(g for g in chunk.groups() if g is not None)
+        pos = chunk.end()
+    if current is not None:
+        words.append(current)
+    return words
+
+
 def prover_from_spec(spec: str, *, input: Optional[str] = None,
                      platform: Union[str, Platform, None] = None) -> SubprocessProver:
     """A subprocess prover from a command line: ``"eprover --auto --cpu-limit=10"``.
@@ -647,14 +673,12 @@ def prover_from_spec(spec: str, *, input: Optional[str] = None,
     if (m := re.match(r"([A-Za-z_][\w.+-]*)=(?=\S)", spec)):
         label, spec = m[1], spec[m.end():]
     try:
-        words = shlex.split(spec, posix=sys.platform != "win32")
+        words = _split_windows(spec) if sys.platform == "win32" else shlex.split(spec)
     except ValueError as e:
         raise ProverError(f"cannot read prover {spec!r}: {e}") from None
     if not words:
         raise ProverError("an empty prover specification")
     binary, rest = words[0], words[1:]
-    if sys.platform == "win32":                 # posix=False keeps the quotes
-        binary = binary.strip("\"'")
     stem = re.sub(r"\.exe$", "", posixpath.basename(binary.replace("\\", "/")), flags=re.IGNORECASE)
     head, at, version = binary.rpartition("@")
     if at and head and "/" not in version and "\\" not in version:
